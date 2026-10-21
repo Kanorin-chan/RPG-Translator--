@@ -238,7 +238,25 @@ def _is_path_like(s):
     return False
 
 
-def should_translate(s, mode=DEFAULT_MODE, origin="offline", require_cjk=True):
+_PLAYER_TEXT_KINDS = ("dialogue", "choice", "name", "desc", "term")
+
+
+def _extracted_player_text(s, kind):
+    """origin="extracted": a reader already knows this field is player-facing, so
+    only blank / payload-less lines are junk. Engine-data regexes are NOT run --
+    they misfire on English dialogue ("I will return home" matches `return\\s`)."""
+    payload = CODE_RE.sub("", s).replace("♡", "").replace("♥", "").strip()
+    if payload == "" or _PURE_NUMERIC_RE.fullmatch(payload):
+        return False
+    if not _ALNUM_RE.search(payload) and not CJK_RE.search(payload):
+        return False
+    if kind == "name" and _IDENT_RE.fullmatch(payload):
+        return False
+    return True
+
+
+def should_translate(s, mode=DEFAULT_MODE, origin="offline", require_cjk=True,
+                     kind=None):
     """Return True if this line is worth sending to the model.
 
     origin distinguishes the two paths, which see very different text:
@@ -262,6 +280,13 @@ def should_translate(s, mode=DEFAULT_MODE, origin="offline", require_cjk=True):
                pure numbers, pure punctuation/symbols, path/filename-like, and
                pure control-code lines (codes/hearts with no real payload).
     """
+    # "extracted": structured reader (project.py). kind says what the field is;
+    # player-facing kinds skip the engine-data regexes, the rest use the live rules.
+    if origin == "extracted":
+        if kind in _PLAYER_TEXT_KINDS:
+            return _extracted_player_text(s, kind)
+        origin = "live"
+
     # Engine data (script / shader / notetag) is never display text, in ANY mode
     # or on either path. Checked first: notetags embed Japanese, so this must
     # win over the CJK test below.
