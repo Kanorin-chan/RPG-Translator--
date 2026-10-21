@@ -1,0 +1,31 @@
+name: Bug report
+description: Something crashed or produced wrong output
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Reader / extract, Patcher / rollback, Translation / safeguards, Providers / concurrency test, Review page / UI, XUnity live server, Other]
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and model
+      placeholder: "LM Studio, gemma-4-12b-qat"
+  - type: textarea
+    id: log
+    attributes:
+      label: Log or traceback
+      render: text
+  - type: markdown
+    attributes:
+      value: Please do not paste API keys or copyrighted game text beyond a line or two.

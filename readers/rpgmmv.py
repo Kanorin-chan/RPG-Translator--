@@ -12,6 +12,7 @@ from readers.base import PatchError, Reader as _Base
 _CJK = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
 _ASSET = re.compile(r"\.(png|jpe?g|webp|ogg|m4a|wav|mp3|json|js|webm|mp4)$", re.I)
 _MAP = re.compile(r"^Map\d+\.json$")
+_NAME_TAG = re.compile(r"\\N<([^>\n]*)>")  # name-window tag at the start of a message
 
 # file -> [(field, kind)]
 _DB = {
@@ -274,8 +275,13 @@ class Reader(_Base):
                     texts.append(cmds[j]["parameters"][0])
                     j += 1
                 spk = params[4] if code == 101 and len(params) > 4 and isinstance(params[4], str) else ""
-                ln = self._add(f, scene, "dialogue", "\n".join(texts), lpath + [i], speaker=spk,
-                               list=lpath, start=i, head=code, cont=cont, n=len(texts))
+                text, tag = "\n".join(texts), ""
+                m = _NAME_TAG.match(text) if code == 101 else None
+                if m and m.group(1).strip() and text[m.end():].strip():
+                    tag, spk, text = m.group(0), m.group(1), text[m.end():]  # tag stays out of the source
+                extra = {"tag": tag} if tag else {}
+                ln = self._add(f, scene, "dialogue", text, lpath + [i], speaker=spk,
+                               list=lpath, start=i, head=code, cont=cont, n=len(texts), **extra)
                 if ln and code == 105:  # scroll text is on-screen but the spec says skip
                     ln.status, ln.note = "skipped", "scroll text (105/405)"
                 i = j
@@ -362,9 +368,13 @@ class Reader(_Base):
             raise PatchError("stale locator for %s" % l.id)
         if s + 1 + n < len(cmds) and cmds[s + 1 + n]["code"] == loc["cont"]:
             raise PatchError("stale locator for %s (group grew)" % l.id)
-        if "\n".join(cmds[s + 1 + k]["parameters"][0] for k in range(n)) != l.source:
+        tag = loc.get("tag", "")
+        if "\n".join(cmds[s + 1 + k]["parameters"][0] for k in range(n)) != tag + l.source:
             raise PatchError("stale locator for %s" % l.id)
-        new = l.translation.split("\n")
+        st = loc.get("speaker_tr")  # translated name, set by the runner
+        if tag and st and ">" not in st and "\n" not in st:
+            tag = "\\N<%s>" % st
+        new = (tag + l.translation).split("\n")
         old = cmds[s + 1:s + 1 + n]
         indent = cmds[s].get("indent", 0)
         out = []

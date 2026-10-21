@@ -283,6 +283,8 @@ def should_translate(s, mode=DEFAULT_MODE, origin="offline", require_cjk=True,
     # "extracted": structured reader (project.py). kind says what the field is;
     # player-facing kinds skip the engine-data regexes, the rest use the live rules.
     if origin == "extracted":
+        if kind == "script":
+            return False  # reader marked it code / risky to modify
         if kind in _PLAYER_TEXT_KINDS:
             return _extracted_player_text(s, kind)
         origin = "live"
@@ -699,6 +701,9 @@ def _rejection_reason(cfg, source, translation):
     if not language_ok(source, translation, cfg):
         return "language_drift"
     return None
+
+
+rejection_reason = _rejection_reason  # public alias for runner
 
 
 def validate_or_recover(cfg, glossary, source, translation, mode=DEFAULT_MODE, context=None):

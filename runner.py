@@ -41,7 +41,7 @@ def _finish(cfg, glossary, mode, src, tr, ctx):
     """Validate one translation. Returns (status, text, note)."""
     if not tr.strip():
         return "kept", src, "empty_output"
-    reason = core._rejection_reason(cfg, src, tr)  # private, but the only source of the reason
+    reason = core.rejection_reason(cfg, src, tr)
     fixed, ok = core.validate_or_recover(cfg, glossary, src, tr, mode, ctx)
     if ok:
         return "ok", fixed, ""
@@ -90,6 +90,56 @@ def _apply(line, res):
 
 def _ctx_arg(pairs):
     return pairs or None
+
+
+# --------------------------------------------------------------------------- #
+# speaker names: translated once per distinct name, stored in project.meta["names"]
+# --------------------------------------------------------------------------- #
+_NAME_INSTR = ("This is a character name from a Japanese game. Output ONLY its %s "
+               "rendering (translate or transliterate), keeping any backslash codes "
+               "exactly as they are:\n\n")
+
+
+def _name_ok(raw, tr):
+    return bool(tr) and "\n" not in tr and ">" not in tr and len(tr) <= 60
+
+
+def _translate_name(cfgs, glossary, mode, raw, temp):
+    """Translation of one speaker name, or None when the LLM failed/was rejected."""
+    if glossary.get(raw):
+        return glossary[raw]
+    if not core.CJK_RE.search(core.CODE_RE.sub("", raw)):
+        return raw  # only codes / no Japanese text: nothing to translate
+    msg = (core.glossary_block(glossary)
+           + _NAME_INSTR % cfgs[0].get("target_language", "Traditional Chinese") + raw)
+    for t in (temp, float(cfgs[0].get("retry_temperature", 0.2))):
+        try:
+            out, used = _fallback_ex(
+                lambda c: core.call_llm(c, msg, t, 200, mode), cfgs)
+        except Exception as e:
+            core.log_failure(raw, "<name error: %r>" % (e,), "name_exception")
+            return None
+        out = out.strip("\n").strip()
+        if _name_ok(raw, out) and core.rejection_reason(used, raw, out) is None:
+            return out
+        core.log_failure(raw, out, "name_rejected")
+    return None
+
+
+def _ensure_names(project, lines, cfgs, glossary, mode, temp, stopping=lambda: False):
+    """Fill project.meta["names"] for the speakers of `lines`, then copy the map onto
+    every tagged line's locator["speaker_tr"] (read by the reader's apply())."""
+    names = project.meta.setdefault("names", {})
+    lines = [l for l in lines if l.speaker and l.locator.get("tag")]  # tagged speakers only
+    for raw in sorted({l.speaker for l in lines if l.speaker not in names}):
+        if stopping():
+            break
+        tr = _translate_name(cfgs, glossary, mode, raw, temp)
+        if tr is not None:
+            names[raw] = tr
+    for l in project.lines:  # every tagged line, so already-ok lines pick up edited names too
+        if l.locator.get("tag") and l.speaker in names:
+            l.locator["speaker_tr"] = names[l.speaker]
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +237,10 @@ def run_project(project, cfgs, glossary, *, project_path=None, concurrency=1,
         except Exception as e:
             core.log_failure("<scene %s>" % item[0], "<crash: %r>" % e, "scene_crash")
 
+    # Names first, single-threaded: one call per distinct name, shared by every scene.
+    _ensure_names(project, [l for _, _, bs in plan for b in bs for l in b],
+                  cfgs, glossary, mode, temp, stopping)
+
     if concurrency == 1:
         for item in plan:
             guarded(item)
@@ -234,6 +288,7 @@ def retranslate_lines(project, line_ids, cfgs, glossary, *, context_k=None,
             counts["missing"] += 1
     picked.sort(key=lambda l: l.order)
 
+    _ensure_names(project, picked, cfgs, glossary, mode, temp)
     for l in picked:
         if stop_flag is not None and stop_flag.is_set():
             stopped = True

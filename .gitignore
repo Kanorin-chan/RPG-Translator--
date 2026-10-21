@@ -13,3 +13,7 @@ smoke.translated.json
 config.local.json
 game/
 providers.json
+config.json
+_rpgt/
+_rpgt_backups/
+_rpgt_work/

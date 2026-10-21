@@ -1,5 +1,16 @@
 # eroge-translator — STATUS
 
+> **2026-10-21 expansion (read this first).** Project is becoming **RPG-Translator**.
+> Spec: `docs/2026-10-21-rpg-translator-expansion.md`. Added since the notes below:
+> `providers.py` + `probe.py` (API styles, fallback, concurrency test) ·
+> `project.py` (scene-ordered lines) · `readers/` (`rpgmmv`, `rpgmruby`, `wolf`,
+> `wolfarchive`) · `runner.py` (scene-based translate, retranslate selected) ·
+> `patcher.py` (stage/verify/backup/rollback) · `review_page.py`, `pages_*.py`, new `ui.py`.
+> `should_translate` gained `origin="extracted"` + `kind`. Line numbers below are stale.
+> **Real-game verified:** RPG Maker MV extract+patch+rollback; Wolf 3.14 extract from
+> archives; a 16-line live LLM run. **Synthetic only:** RPG Maker XP/VX/VXAce.
+> **Never run in-game:** any patched game. 159 unit tests, stdlib `unittest`.
+
 > **Verified against code: 2026-07-12.** If the code and this doc disagree,
 > **the code is right** — fix this file, then continue.
 

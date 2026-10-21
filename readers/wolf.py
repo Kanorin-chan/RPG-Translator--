@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Wolf RPG Editor reader (extracted Data folder only; archives are NOT decrypted).
+Wolf RPG Editor reader: loose Data files and/or .wolf archives (unpacked by wolfarchive.py
+into a temp cache; patched files are always written to the loose Data/... paths).
 
 File-format logic (header byte + LCG seeds + per-interval XOR, map/common-event/
 database layouts, command ids) is ported from rewolf-trans (MIT, KCFindstr):
@@ -14,12 +15,18 @@ so everything we do not understand (unknown commands, 'unknown' fields) is prese
 byte-for-byte by construction. Standard library only.
 """
 
+import hashlib
+import json
 import os
 import re
+import shutil
+import tempfile
 
 from project import Line
+from readers import wolfarchive
 from readers.base import PatchError, Reader as _Base
 
+WORK_ROOT = os.path.join(tempfile.gettempdir(), "rpgt_wolf")  # archive extraction cache
 CRYPT_HEADER_SIZE = 10
 DECRYPT_INTERVALS = (1, 2, 5)
 DB_SEEDS = (0, 3, 6)
@@ -29,12 +36,17 @@ JP_HEADER = bytes([0] * 10 + [0x57, 0x4F, 0x4C, 0x46, 0x4D, 0, 0, 0, 0, 0, 0x64,
                               0x65, 0x05, 0, 0, 0, 0x82, 0xC8, 0x82, 0xB5, 0])
 EN_HEADER = bytes([0] * 10 + [0x57, 0x4F, 0x4C, 0x46, 0x4D, 0, 0, 0, 0, 0, 0x64, 0, 0, 0,
                               0x65, 0x03, 0, 0, 0, 0x4E, 0x6F, 0])
+MAP_MAGIC = bytes(10) + b"WOLFM\0"
+UTF8_FLAG = 0x55
 EVENT_START = bytes([0x39, 0x30, 0, 0])
 EVENT_END = bytes(4)
 COMMAND_END = bytes([3, 0, 0, 0])
 ROUTE_TERM = bytes([1, 0])
 CE_HEADER = bytes([0x00, 0x57, 0x00, 0x00, 0x4F, 0x4C, 0x00, 0x46, 0x43, 0x00, 0x8F])
 DB_HEADER = bytes([0x00, 0x57, 0x00, 0x00, 0x4F, 0x4C, 0x00, 0x46, 0x4D, 0x00, 0xC1])
+CE_MAGIC = CE_HEADER[:10]  # the 11th byte is the editor version (0x8F old, 0xC9 in Wolf 3.1x)
+DB_MAGIC = DB_HEADER[:10]
+DB_STRING_INDICATOR = 0x0001D4C0
 DB_SEP = bytes([0xFE, 0xFF, 0xFF, 0xFF])
 STRING_START = 0x07D0
 GAME_MAGIC = bytes([0x57, 0x00, 0x00, 0x4F, 0x4C, 0x00, 0x46, 0x4D, 0x00])
@@ -215,15 +227,24 @@ def _command_items(cid, args, strs, path, scene, out):
 
 def parse_map(data, stem):
     c = _Cur(data)
-    if data.startswith(JP_HEADER):
-        c.take(len(JP_HEADER))
-    elif data.startswith(EN_HEADER):
-        c.take(len(EN_HEADER))
-    else:
+    if data[:len(MAP_MAGIC)] != MAP_MAGIC:
         raise ParseError("unrecognised map header (other Wolf version?)")
-    c.u32()
+    c.take(len(MAP_MAGIC))
+    if c.u8() not in (0, UTF8_FLAG):  # byte 16: 0x55 = engine reads strings as UTF-8
+        raise ParseError("unrecognised map header flag")
+    c.take(3)
+    ver = c.u32()
+    if ver >= 0x65:
+        raise ParseError("map version 0x%X is LZ4-packed (Wolf 3.5+), not supported" % ver)
+    c.u8()
+    c.string()  # editor-side note
+    c.u32()  # tileset
     w, h, evc = c.u32(), c.u32(), c.u32()
-    c.take(w * h * 12)
+    layers = 3
+    if c.p + 4 <= len(c.d) and c.d[c.p:c.p + 4] == bytes.fromhex("ffffffff"):
+        c.take(4)  # UTF-8 maps may omit the tile block
+        layers = 0
+    c.take(w * h * layers * 4)
     out = []
     n = 0
     while True:
@@ -248,8 +269,10 @@ def parse_map(data, stem):
                 _route(c)
             for ci, (cid, args, strs) in enumerate(_commands(c)):
                 _command_items(cid, args, strs, "e%d/p%d/c%d" % (eid, pn, ci), scene, out)
-            c.expect(COMMAND_END)
+            feat = c.u32()  # page "features"; >3 adds one byte (UberWolf Map.hpp)
             c.take(3)
+            if feat > 3:
+                c.u8()
             if c.u8() != 0x7A:
                 raise ParseError("bad page terminator at 0x%x" % (c.p - 1))
             pn += 1
@@ -269,7 +292,10 @@ def parse_map(data, stem):
 
 def parse_common(data):
     c = _Cur(data)
-    c.expect(CE_HEADER)
+    _flagged_magic(c, CE_MAGIC, "CommonEvent.dat")
+    ver = c.u8()
+    if ver in (0x93, 0xCC):
+        raise ParseError("CommonEvent version 0x%X is LZ4-packed (Wolf 3.5+), not supported" % ver)
     out = []
     for _ in range(c.count()):
         if c.u8() != 0x8E:
@@ -316,11 +342,20 @@ def parse_common(data):
             c.u32()
             if c.u8() != 0x92:
                 raise ParseError("bad closing indicator4 at 0x%x" % (c.p - 1))
-    if c.u8() != 0x8F:
+    if c.u8() < 0x89:
         raise ParseError("bad common event file end")
     if not c.eof:
         raise ParseError("trailing bytes after common events")
     return out
+
+
+def _flagged_magic(c, magic, what):
+    """10 bytes `00 57 00 00 4F 4C <00|55> 46 <43|4D> 00`: byte 6 = 0x55 marks a UTF-8 game."""
+    raw = c.take(len(magic))
+    if raw[6] == UTF8_FLAG:
+        raw = raw[:6] + b"\0" + raw[7:]
+    if raw != magic:
+        raise ParseError("%s: unrecognised header %s" % (what, raw.hex()))
 
 
 def _parse_project(proj):
@@ -351,21 +386,23 @@ def parse_db(proj, dat, stem):
     payload, hdr = _decrypt(dat, DB_SEEDS)
     d = _Cur(payload)
     if hdr is not None:
-        d.u8()
+        dbver = d.u8()
     else:
-        d.expect(DB_HEADER)
+        _flagged_magic(d, DB_MAGIC, "database .dat")
+        dbver = d.u8()
     if d.u32() != len(types):
         raise ParseError("type count mismatch between .dat and .project")
     out = []
     for ti, (tname, fnames, dnames, ftypes) in enumerate(types):
         d.expect(DB_SEP)
-        d.u32()
+        if d.u32() == DB_STRING_INDICATOR:
+            d.string()
         infos = [d.u32() for _ in range(d.count())]
         if len(infos) > len(fnames):
             raise ParseError("type %d: .dat has more fields than .project" % ti)
         nstr = sum(1 for i in infos if i >= STRING_START)
         nint = len(infos) - nstr
-        ds = d.count()
+        ds = d.u32()  # not count(): a type with no fields stores its entries in zero bytes
         if ds > len(dnames):
             raise ParseError("type %d: .dat has more entries than .project" % ti)
         scene = "DB:%s/t%d" % (stem, ti)
@@ -388,7 +425,7 @@ def parse_db(proj, dat, stem):
                 kind = "desc" if (_DESC_FIELD.search(fnames[fi]) or "\n" in text) else "name"
                 ctx = "%s / %s / %s" % (tname, dnames[di], fnames[fi])
                 out.append((kind, "t%d/d%d/f%d" % (ti, di, idx), scene, sp, {"ctx": ctx}))
-    d.u8()  # trailing 0xC1; rewolf only logs when absent
+    d.u8()  # trailing version byte (equals dbver); rewolf only logs when absent
     return out
 
 
@@ -396,7 +433,11 @@ def parse_game(raw):
     payload, hdr = _decrypt(raw, GAME_SEEDS)
     c = _Cur(payload)
     if hdr is None:
-        c.expect(b"\x00" + GAME_MAGIC)
+        raw = c.take(1 + len(GAME_MAGIC))
+        if raw[9] == UTF8_FLAG:  # same "U" marker as the other files, at index 9 here
+            raw = raw[:9] + bytes(1)
+        if raw != bytes(1) + GAME_MAGIC:
+            raise ParseError("Game.dat: unrecognised header %s" % raw.hex())
     c.take(c.count())
     ver = c.u32()
     title = c.string()
@@ -405,16 +446,32 @@ def parse_game(raw):
     c.take(c.count())
     for _ in range(5):  # font, 3 subfonts, default pc graphic
         c.string()
+    strs = [("title", title)]
     if ver >= 9:
+        strs.append(("titleplus", c.string()))
+    if ver > 9:  # road image, gauge image, start-up message, title message
+        strs += [("roadimg", c.string()), ("gaugeimg", c.string()),
+                 ("startup", c.string()), ("titlemsg", c.string())]
+    if ver > 13:
         c.string()
     szoff = c.p
     szval = c.u32()
+    ioff = None  # two u32 offsets after the word table; the game expects them shifted with the size
+    try:
+        c.u32()
+        c.take(c.u32() * 2)
+        ioff = c.p
+        c.u32()
+        c.u32()
+    except ParseError:
+        pass
     hl = CRYPT_HEADER_SIZE if hdr is not None else 0
-    text, _ = decode(title[2])
     out = []
-    if not _blank(text):
-        out.append(("other", "title", "Game", title,
-                    {"szoff": szoff, "szfix": szval == len(payload) + hl - 1}))
+    for name, sp in strs:
+        if name in ("roadimg", "gaugeimg") or _blank(decode(sp[2])[0]):
+            continue  # image file names are not text
+        out.append(("other", name, "Game", sp,
+                    {"szoff": szoff, "szfix": szval == len(payload) + hl - 1, "ioff": ioff}))
     return out
 
 
@@ -443,50 +500,120 @@ def _natkey(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
-def _scan(root):
-    """-> dict(maps=[...], ce=path|None, dbs=[(project, dat)], game=path|None)."""
+def _wolf_archives(root):
+    """Every .wolf next to the game exe or inside Data/."""
+    out = []
+    for d in (root, _ci_child(root, "Data")):
+        if d and os.path.isdir(d):
+            out += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.lower().endswith(".wolf")]
+    return out
+
+
+def _cache_data_dir(root, errors=None):
+    """Data mirror extracted from the .wolf archives, or None. Lives in the OS temp dir (never in
+    the game folder), keyed by the archives' name/size/mtime so a shadow copy of the game (the
+    patcher's verify step) and the real folder share one extraction."""
+    arcs = _wolf_archives(root)
+    if not arcs:
+        return None
+    sig = hashlib.sha1()
+    for a in arcs:
+        try:
+            st = os.stat(a)
+        except OSError:
+            continue
+        sig.update(("%s|%d|%d;" % (os.path.basename(a).lower(), st.st_size, st.st_mtime_ns)).encode())
+    base = os.path.join(WORK_ROOT, sig.hexdigest()[:16])
+    data = os.path.join(base, "Data")
+    marker = os.path.join(base, "ok.json")
+    if os.path.isfile(marker):
+        return data
+    tmp = base + ".part%d" % os.getpid()
+    shutil.rmtree(tmp, ignore_errors=True)
+    errs, got = {}, 0
+    for d in sorted({os.path.dirname(a) for a in arcs}):
+        res = wolfarchive.unpack_game_data(d, os.path.join(tmp, "Data"))
+        errs.update(res.pop("_errors"))
+        got += sum(len(v) for v in res.values())
+    if errors is not None:
+        errors.update(errs)
+    if not got:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    with open(os.path.join(tmp, "ok.json"), "w", encoding="utf-8") as f:
+        json.dump({"archives": [os.path.basename(a) for a in arcs], "errors": errs}, f)
+    shutil.rmtree(base, ignore_errors=True)
+    try:
+        os.replace(tmp, base)
+    except OSError:  # another process won the race
+        shutil.rmtree(tmp, ignore_errors=True)
+    return data if os.path.isfile(marker) else None
+
+
+def _scan(root, use_archives=True, errors=None):
+    """-> dict(maps=[(rel, path)], ce=(rel, path)|None, dbs=[((rel, proj), (rel, dat))], game=(rel, path)|None).
+    `rel` is always the LOOSE-file location relative to root (what apply() writes); `path` is where
+    the bytes are read from: a loose file if present, else the archive extraction."""
     res = {"maps": [], "ce": None, "dbs": [], "game": None}
     dd = _data_dir(root)
-    if not dd:
-        return res
-    md = _ci_child(dd, "MapData")
-    if md and os.path.isdir(md):
-        res["maps"] = sorted((os.path.join(md, f) for f in os.listdir(md)
-                              if f.lower().endswith(".mps")), key=lambda p: _natkey(os.path.basename(p)))
-    bd = _ci_child(dd, "BasicData")
-    if bd and os.path.isdir(bd):
-        res["ce"] = _ci_child(bd, "CommonEvent.dat")
-        res["game"] = _ci_child(bd, "Game.dat")
-        for f in sorted(os.listdir(bd), key=_natkey):
-            if f.lower().endswith(".project") and f.lower() != "sysdatabasebasic.project":
-                dat = _ci_child(bd, f[:-8] + ".dat")
-                if dat:
-                    res["dbs"].append((os.path.join(bd, f), dat))
+    prefix = os.path.relpath(dd, root).replace(os.sep, "/") if dd else "Data"
+    prefix = "" if prefix == "." else prefix + "/"
+    dirs = [dd] if dd else []
+    if use_archives and _wolf_archives(root):
+        cd = _cache_data_dir(root, errors)
+        if cd:
+            dirs.append(cd)  # later = lower priority: loose files shadow the archives
+
+    def merged(sub):
+        """lower-case file name -> (rel, path), loose first."""
+        out = {}
+        for d in dirs:
+            sd = _ci_child(d, sub)
+            if sd and os.path.isdir(sd):
+                for f in os.listdir(sd):
+                    out.setdefault(f.lower(), ("%s%s/%s" % (prefix, os.path.basename(sd) if d is dd else sub, f),
+                                               os.path.join(sd, f)))
+        return out
+
+    maps = merged("MapData")
+    res["maps"] = sorted((v for k, v in maps.items() if k.endswith(".mps")),
+                         key=lambda v: _natkey(os.path.basename(v[0])))
+    basic = merged("BasicData")
+    res["ce"] = basic.get("commonevent.dat")
+    res["game"] = basic.get("game.dat")
+    for k in sorted(basic, key=_natkey):
+        if k.endswith(".project") and k != "sysdatabasebasic.project":
+            dat = basic.get(k[:-8] + ".dat")
+            if dat:
+                res["dbs"].append((basic[k], dat))
     return res
 
 
 def archive_status(root):
-    """'extracted' | 'archive-encrypted' | 'none'. We never decrypt .wolf archives."""
-    s = _scan(root)
+    """'extracted' (loose files) | 'archive' (readable .wolf, unpacked on demand) |
+    'archive-encrypted' (.wolf we cannot read) | 'none'."""
+    s = _scan(root, use_archives=False)
     if s["maps"] or s["ce"] or s["dbs"] or s["game"]:
         return "extracted"
-    try:
-        if any(f.lower().endswith(".wolf") for f in os.listdir(root)):
-            return "archive-encrypted"
-    except OSError:
-        pass
-    return "none"
+    arcs = _wolf_archives(root)
+    if not arcs:
+        return "none"
+    for a in arcs:
+        stem = os.path.splitext(os.path.basename(a))[0].lower()
+        if stem in ("data", "basicdata", "mapdata"):
+            try:
+                if wolfarchive.is_dxa(a) and wolfarchive.detect_key(a) is not None:
+                    return "archive"
+            except (wolfarchive.DxaError, OSError):
+                pass
+    return "archive-encrypted"
 
 
 # ---------------------------------------------------------------- reader
 
-def _rel(root, path):
-    return os.path.relpath(path, root).replace(os.sep, "/")
-
-
 class Reader(_Base):
     name = "wolf"
-    label = "Wolf RPG Editor (extracted Data folder)"
+    label = "Wolf RPG Editor (Data folder or .wolf archives)"
 
     def __init__(self, write_encoding="utf-8"):
         self.write_encoding = write_encoding
@@ -495,23 +622,24 @@ class Reader(_Base):
 
     @classmethod
     def detect(cls, root):
-        return archive_status(root) == "extracted"
+        return archive_status(root) in ("extracted", "archive")
 
     def extract(self, root):
         self.warnings = []
-        s = _scan(root)
+        errs = {}
+        s = _scan(root, errors=errs)
+        self.warnings += [(k, "archive: " + v) for k, v in sorted(errs.items())]
         stem = lambda p: os.path.splitext(os.path.basename(p))[0]
-        jobs = [("mps", m, lambda raw, m=m: parse_map(raw, stem(m))) for m in s["maps"]]
+        jobs = [("mps", m, lambda raw, m=m: parse_map(raw, stem(m[1]))) for m in s["maps"]]
         if s["ce"]:
             jobs.append(("ce", s["ce"], parse_common))
         for proj, dat in s["dbs"]:
-            jobs.append(("db", dat, lambda raw, proj=proj, dat=dat: parse_db(_read(proj), raw, stem(dat))))
+            jobs.append(("db", dat, lambda raw, proj=proj, dat=dat: parse_db(_read(proj[1]), raw, stem(dat[1]))))
         if s["game"]:
             jobs.append(("game", s["game"], parse_game))
 
         lines, encs = [], set()
-        for ftype, path, fn in jobs:
-            rel = _rel(root, path)
+        for ftype, (rel, path), fn in jobs:
             try:
                 raw = _read(path)
                 items = fn(raw)
@@ -538,8 +666,11 @@ class Reader(_Base):
                 continue
             by_file.setdefault(l.file, []).append(l)
         written = []
+        s = _scan(root)  # reads from loose files else the archive extraction; writes go to loose paths
+        phys = {rel: path for rel, path in s["maps"] + [x for x in (s["ce"], s["game"]) if x]
+                + [d for _, d in s["dbs"]]}
         for rel in sorted(by_file):
-            src = os.path.join(root, *rel.split("/"))
+            src = phys.get(rel) or os.path.join(root, *rel.split("/"))
             try:
                 raw = _read(src)
             except OSError as e:
@@ -582,6 +713,14 @@ class Reader(_Base):
                     shift = sum(d for o, d in delta_before if o < szoff)
                     total = len(out) + (CRYPT_HEADER_SIZE if hdr is not None else 0)
                     out[szoff + shift:szoff + shift + 4] = (total - 1).to_bytes(4, "little")
+                    ioff = loc.get("ioff")
+                    if isinstance(ioff, int):
+                        diff = len(out) - len(payload)
+                        sh = sum(d for o, d in delta_before if o < ioff)
+                        for k in (0, 4):
+                            at = ioff + sh + k
+                            v = int.from_bytes(out[at:at + 4], "little")
+                            out[at:at + 4] = ((v + diff) & 0xFFFFFFFF).to_bytes(4, "little")
             data = _encrypt(out, hdr, seeds) if ftype in ("db", "game") else bytes(out)
             dst = os.path.join(out_root, *rel.split("/"))
             os.makedirs(os.path.dirname(dst), exist_ok=True)

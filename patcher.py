@@ -55,6 +55,27 @@ def _swap_one(src, dst):
     _atomic_copy(src, dst)  # separate name so tests can inject failure here only
 
 
+def _missing_dirs(root, rels):
+    """Parent directories of `rels` that do not exist yet (shallowest first), so rollback can
+    remove the ones a new file caused to be created."""
+    out = []
+    for rel in rels:
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            d = "/".join(parts[:i])
+            if d not in out and not os.path.isdir(_path(root, d)):
+                out.append(d)
+    return out
+
+
+def _prune_dirs(root, rels):
+    for d in sorted(rels, key=lambda r: r.count("/"), reverse=True):
+        try:
+            os.rmdir(_path(root, d))  # only succeeds when empty, so it never touches user data
+        except OSError:
+            pass
+
+
 def _mkdtemp(root, prefix):
     parent = os.path.dirname(os.path.abspath(root))
     try:
@@ -151,8 +172,10 @@ def patch_game(root, reader, project_lines, backup_dir=None, on_log=None):
         for f in files:
             if f["before"] is not None:
                 _atomic_copy(_path(root, f["path"]), _path(bdir, f["path"]))
+        # before=None marks a file the patch CREATES (no original to back up; rollback deletes it)
         manifest = {"version": 1, "reader": reader.name, "created": stamp,
-                    "root": root, "backup_path": bdir, "status": "pending", "files": files}
+                    "root": root, "backup_path": bdir, "status": "pending", "files": files,
+                    "new_dirs": _missing_dirs(root, [f["path"] for f in files if f["before"] is None])}
         _write_manifest(bdir, manifest)
         _log(on_log, "backed up %d file(s) to %s" % (len(files), bdir))
 
@@ -175,6 +198,7 @@ def patch_game(root, reader, project_lines, backup_dir=None, on_log=None):
                         _atomic_copy(_path(bdir, f["path"]), dst)
                 except OSError as e2:
                     _log(on_log, "RESTORE FAILED %s: %s" % (f["path"], e2))
+            _prune_dirs(root, manifest["new_dirs"])
             manifest["status"] = "failed-restored"
             _write_manifest(bdir, manifest)
             raise PatchAborted("swap failed, originals restored: %s" % e) from e
@@ -232,7 +256,8 @@ def rollback(root, manifest_or_path, on_log=None, force=False):
             _atomic_copy(_path(bdir, f["path"]), dst)
             if sha256(dst) != f["before"]:
                 raise OSError("restored file hash mismatch: %s" % f["path"])
-        _log(on_log, "restored %s" % f["path"])
+        _log(on_log, "restored %s" % f["path"] if f["before"] is not None else "removed %s" % f["path"])
+    _prune_dirs(root, m.get("new_dirs", []))
     return [f["path"] for f in todo]
 
 

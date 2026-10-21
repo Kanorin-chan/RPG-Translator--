@@ -255,6 +255,56 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((s["ok"], s["failed"]), (0, 9))
         self.assertEqual({l.status for l in p.lines if l.source not in ("…", "\\N[1]")}, {"new"})
 
+    def _tagged(self):
+        lines = []
+        for n, (sc, sp, src) in enumerate([("A", "白築 エル", "A0"), ("A", "桐島 \\N[1]", "A1"),
+                                           ("B", "白築 エル", "B0"), ("B", "\\N[2]", "B1"),
+                                           ("B", "", "B2")]):
+            lines.append(pj.Line(id="f#%d" % n, file="f", scene=sc, order=n, kind="dialogue",
+                                 source=src, speaker=sp, locator={"tag": "\\N<%s>" % sp} if sp else {}))
+        return pj.Project(root="r", engine="t", lines=lines)
+
+    def test_names_translated_once_across_scenes(self):
+        # a fresh answer per call would make the two scenes disagree; one call per name can't
+        self.use(Fake({"白築 エル": ["白築 艾露", "白築 艾爾"], "桐島 \\N[1]": ["桐島 \\N[1]"]}))
+        p = self._tagged()
+        s = runner.run_project(p, [cfg()], {"桐島": "X"})
+        self.assertEqual(s["ok"], 5)
+        name_calls = [c[2][0] for c in self.fake.calls
+                      if c[0] == "solo" and c[2][0] in ("白築 エル", "桐島 \\N[1]", "\\N[2]")]
+        self.assertEqual(sorted(name_calls), ["桐島 \\N[1]", "白築 エル"])  # \N[2] is code-only: no call
+        self.assertEqual(p.meta["names"], {"白築 エル": "白築 艾露", "桐島 \\N[1]": "桐島 \\N[1]",
+                                           "\\N[2]": "\\N[2]"})
+        self.assertEqual([l.locator.get("speaker_tr") for l in p.lines],
+                         ["白築 艾露", "桐島 \\N[1]", "白築 艾露", "\\N[2]", None])
+        # batch prompts carry only dialogue text -- never the tag or a name
+        self.assertTrue(all("\\N<" not in s for s in self.fake.sent()))
+
+    def test_name_from_glossary_no_call(self):
+        p = self._tagged()
+        runner.run_project(p, [cfg()], {"白築 エル": "白築艾露"})
+        self.assertEqual(p.meta["names"]["白築 エル"], "白築艾露")
+        self.assertNotIn("白築 エル", self.fake.sent())
+
+    def test_name_rejected_stays_unmapped_and_run_continues(self):
+        self.use(Fake({"白築 エル": ["エル", "エル"]}))  # kana residue twice
+        p = self._tagged()
+        s = runner.run_project(p, [cfg()], {})
+        self.assertEqual(s["ok"], 5)
+        self.assertNotIn("白築 エル", p.meta["names"])
+        self.assertIsNone(p.lines[0].locator.get("speaker_tr"))
+
+    def test_resume_does_not_retranslate_names(self):
+        self.use(Fake({"白築 エル": ["白築 艾露"]}))
+        p = self._tagged()
+        runner.run_project(p, [cfg()], {})
+        self.fake.calls.clear()
+        runner.run_project(p, [cfg()], {}, force=True)
+        self.assertNotIn("白築 エル", self.fake.sent())
+
+    def test_kept_note_uses_public_reason(self):
+        self.assertIs(core.rejection_reason, core._rejection_reason)
+
     def test_call_with_fallback_raises_last(self):
         def f(c):
             raise RuntimeError(c["n"])

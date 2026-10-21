@@ -151,5 +151,155 @@ class TestPatcher(unittest.TestCase):
         self.assertEqual(snapshot(self.root), self.before)
 
 
+class NewFileReader:
+    """Stub: edits a.txt in place and CREATES sub/dir/new.txt (the Wolf archive case)."""
+    name = "stub"
+
+    def extract(self, root):
+        from project import Line
+        out = []
+        with open(os.path.join(root, "a.txt"), encoding="utf-8") as fh:
+            text = fh.read()
+        for i, t in enumerate(text.split("\n")):
+            out.append(Line(id="a.txt#%d" % i, file="a.txt", scene="s", order=i, kind="dialogue", source=t))
+        return out
+
+    def apply(self, root, out_root, lines):
+        for rel, txt in (("a.txt", "\n".join(l.translation or l.source for l in lines)),
+                         ("sub/dir/new.txt", "created")):
+            d = os.path.join(out_root, *rel.split("/"))
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            with open(d, "w", encoding="utf-8", newline="") as f:
+                f.write(txt)
+        return ["a.txt", "sub/dir/new.txt"]
+
+
+class TestNewFiles(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = os.path.join(self.tmp, "g")
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, "a.txt"), "w", encoding="utf-8", newline="") as f:
+            f.write("one\ntwo")
+        self.before = snapshot(self.root)
+        self.r = NewFileReader()
+        self.lines = self.r.extract(self.root)
+        self.lines[0].translation = "ONE"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_new_file_manifest_and_rollback_deletes_it(self):
+        m = patcher.patch_game(self.root, self.r, self.lines)
+        f = {x["path"]: x for x in m["files"]}
+        self.assertIsNone(f["sub/dir/new.txt"]["before"])
+        self.assertIsNotNone(f["a.txt"]["before"])
+        self.assertEqual(m["new_dirs"], ["sub", "sub/dir"])
+        self.assertEqual(open(os.path.join(self.root, "sub", "dir", "new.txt")).read(), "created")
+        # only the existing file is backed up
+        self.assertTrue(os.path.isfile(os.path.join(m["backup_path"], "a.txt")))
+        self.assertFalse(os.path.exists(os.path.join(m["backup_path"], "sub")))
+        done = patcher.rollback(self.root, m)
+        self.assertEqual(sorted(done), ["a.txt", "sub/dir/new.txt"])
+        self.assertEqual(snapshot(self.root), self.before)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "sub")))  # created dirs pruned too
+
+    def test_rollback_refuses_edited_new_file_unless_force(self):
+        m = patcher.patch_game(self.root, self.r, self.lines)
+        p = os.path.join(self.root, "sub", "dir", "new.txt")
+        with open(p, "a") as fh:
+            fh.write(" + user edit")
+        with self.assertRaises(patcher.RollbackRefused):
+            patcher.rollback(self.root, m)
+        self.assertTrue(os.path.exists(p))
+        with open(os.path.join(self.root, "a.txt")) as fh:
+            self.assertEqual(fh.read(), "ONE\ntwo")  # nothing half-done
+        patcher.rollback(self.root, m, force=True)
+        self.assertEqual(snapshot(self.root), self.before)
+
+    def test_rollback_keeps_dir_with_foreign_files(self):
+        m = patcher.patch_game(self.root, self.r, self.lines)
+        keep = os.path.join(self.root, "sub", "dir", "mine.txt")
+        with open(keep, "w") as fh:
+            fh.write("x")
+        patcher.rollback(self.root, m)
+        self.assertTrue(os.path.isfile(keep))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "sub", "dir", "new.txt")))
+
+    def test_rollback_when_new_file_already_gone(self):
+        m = patcher.patch_game(self.root, self.r, self.lines)
+        os.remove(os.path.join(self.root, "sub", "dir", "new.txt"))
+        patcher.rollback(self.root, m)
+        self.assertEqual(snapshot(self.root), self.before)
+
+    def test_swap_failure_on_second_file_removes_created_file_and_dirs(self):
+        real = patcher._atomic_copy
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:  # files are swapped in sorted order: a.txt, then the new one
+                raise OSError("disk full (injected)")
+            return real(src, dst)
+
+        with mock.patch.object(patcher, "_swap_one", flaky):
+            with self.assertRaises(patcher.PatchAborted):
+                patcher.patch_game(self.root, self.r, self.lines)
+        self.assertEqual(snapshot(self.root), self.before)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "sub")))
+
+    def test_old_manifest_without_new_dirs_still_rolls_back(self):
+        m = patcher.patch_game(self.root, self.r, self.lines)
+        m.pop("new_dirs")
+        patcher.rollback(self.root, m)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "sub", "dir", "new.txt")))
+
+
+class TestWolfFromArchives(unittest.TestCase):
+    """End to end on a synthetic archive-only Wolf game: patch writes LOOSE files, rollback removes them."""
+
+    def setUp(self):
+        import test_wolf as tw
+        import test_wolfarchive as twa
+        from readers import wolf
+        self.wolf, self.tmp = wolf, tempfile.mkdtemp()
+        wolf.WORK_ROOT = os.path.join(self.tmp, "work")
+        src = os.path.join(self.tmp, "src")
+        tw.make_game(src, enc="utf-8", utf8=True)
+        self.root = os.path.join(self.tmp, "g")
+        os.makedirs(os.path.join(self.root, "Data"))
+        for stem in ("BasicData", "MapData"):
+            d = os.path.join(src, "Data", stem)
+            tree = {f: tw.rd(os.path.join(d, f)) for f in os.listdir(d)}
+            tw.write(self.root, "Data/%s.wolf" % stem,
+                     twa.build_archive(tree, keystring=wolf.wolfarchive.WOLF_KEYS[0x13A], mode="mix"))
+        self.before = snapshot(self.root)
+        self.R = wolf.Reader()
+        self.lines = self.R.extract(self.root)
+        for l in self.lines:
+            if l.kind == "dialogue":
+                l.translation = "EN:" + l.source
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_patch_then_rollback(self):
+        m = patcher.patch_game(self.root, self.R, self.lines)
+        self.assertEqual(m["status"], "applied")
+        self.assertTrue(m["files"])
+        for f in m["files"]:
+            self.assertIsNone(f["before"])  # nothing existed loose: every file is new
+            self.assertTrue(f["path"].startswith(("Data/MapData/", "Data/BasicData/")), f["path"])
+            self.assertTrue(os.path.isfile(os.path.join(self.root, *f["path"].split("/"))))
+        after = snapshot(self.root)
+        for k, v in self.before.items():  # the archives themselves are never touched
+            self.assertEqual(after[k], v)
+        again = self.wolf.Reader().extract(self.root)
+        self.assertTrue(any(l.source.startswith("EN:") for l in again))
+        patcher.rollback(self.root, m)
+        self.assertEqual(snapshot(self.root), self.before)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.root, "Data"))), ["BasicData.wolf", "MapData.wolf"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,22 @@
+{
+  "endpoint_url": "http://127.0.0.1:8123/v1/chat/completions",
+  "model": "your-model-id",
+  "target_language": "Traditional Chinese",
+  "mode": "dynamic",
+  "batch_size": 40,
+  "concurrency": 4,
+  "temperature": 0.3,
+  "retry_temperature": 0.2,
+  "max_tokens_per_entry": 60,
+  "request_timeout_seconds": 600,
+  "network_retries": 3,
+  "save_every_batches": 5,
+  "xunity_port": 4404,
+  "xunity_host": "127.0.0.1",
+  "cache_save_every": 10,
+  "quiet": false,
+  "context_enabled": true,
+  "context_window": 4,
+  "offline_require_cjk": true,
+  "reasoning_effort": "none"
+}

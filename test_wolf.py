@@ -38,11 +38,18 @@ def cmd(cid, args=(), strs=(), indent=0, enc="cp932", move=False):
     return b + u8(0)
 
 
-def page(cmds, enc="cp932"):
+def flagged(header, idx):
+    """Mark a header as a UTF-8 game: byte `idx` becomes 0x55 ('U')."""
+    return header[:idx] + bytes([0x55]) + header[idx + 1:]
+
+
+def page(cmds, enc="cp932", features=3):
     b = u32(0) + wstr("", enc) + bytes(4) + bytes(37) + bytes(4) + u8(0) + u8(0)
     b += u32(0)  # routes
-    b += u32(len(cmds)) + b"".join(cmds) + wolf.COMMAND_END + bytes(3) + u8(0x7A)
-    return b
+    b += u32(len(cmds)) + b"".join(cmds) + u32(features) + bytes(3)
+    if features > 3:
+        b += u8(0)  # page-transfer byte
+    return b + u8(0x7A)
 
 
 def event(eid, name, pages, enc="cp932"):
@@ -52,13 +59,14 @@ def event(eid, name, pages, enc="cp932"):
     return u8(0x6F) + b + u8(0x70)
 
 
-def mps(events):
-    return (wolf.JP_HEADER + u32(0) + u32(2) + u32(1) + u32(len(events)) + bytes(24)
-            + b"".join(events) + u8(0x66))
+def mps(events, utf8=False, no_tiles=False):
+    hdr = flagged(wolf.JP_HEADER, 16) if utf8 else wolf.JP_HEADER
+    tiles = b"\xff\xff\xff\xff" if no_tiles else bytes(24)
+    return hdr + u32(0) + u32(2) + u32(1) + u32(len(events)) + tiles + b"".join(events) + u8(0x66)
 
 
-def common(events_spec, enc="cp932"):
-    b = wolf.CE_HEADER + u32(len(events_spec))
+def common(events_spec, enc="cp932", utf8=False):
+    b = (flagged(wolf.CE_HEADER, 6) if utf8 else wolf.CE_HEADER)[:10] + u8(0xC9) + u32(len(events_spec))
     for eid, name, cmds, strarg in events_spec:
         b += u8(0x8E) + u32(eid) + u32(0) + bytes(7) + wstr(name, enc)
         b += u32(len(cmds)) + b"".join(cmds) + wstr("", enc) + wstr("desc", enc) + u8(0x8F)
@@ -72,7 +80,7 @@ def common(events_spec, enc="cp932"):
     return b + u8(0x8F)
 
 
-def db_files(enc="cp932", encrypted=False):
+def db_files(enc="cp932", encrypted=False, utf8=False):
     """One type, 2 fields (int 'HP', string 'name' type0 + string 'help' type0), 2 entries."""
     proj = u32(1) + wstr("アイテム", enc)
     proj += u32(3) + wstr("HP", enc) + wstr("名前", enc) + wstr("説明", enc)
@@ -83,7 +91,7 @@ def db_files(enc="cp932", encrypted=False):
     proj += u32(3) + u32(0) + u32(0) + u32(0)
     proj += u32(3) + u32(0) + u32(0) + u32(0)
     proj += u32(3) + u32(0) + u32(0) + u32(0)
-    dat = u32(1) + wolf.DB_SEP + u32(0) + u32(3)
+    dat = u32(1) + wolf.DB_SEP + (u32(wolf.DB_STRING_INDICATOR) + wstr("x", enc) if utf8 else u32(0)) + u32(3)
     dat += u32(0x3E8) + u32(wolf.STRING_START) + u32(wolf.STRING_START + 1)
     dat += u32(2)
     for hp, nm, ds in ((10, "薬草", "傷を治す。\n少し。"), (0, "毒消し", "毒を治す")):
@@ -93,7 +101,21 @@ def db_files(enc="cp932", encrypted=False):
         hdr = bytes([0x41, 9, 9, 0x13, 9, 9, 0x27, 9, 9, 9])
         body = xor_crypt(wolf.DB_HEADER[10:] + dat, [hdr[i] for i in wolf.DB_SEEDS])
         return proj, hdr + body
-    return proj, wolf.DB_HEADER + dat
+    return proj, (flagged(wolf.DB_HEADER, 6) if utf8 else wolf.DB_HEADER) + dat
+
+
+def game_dat14(title, startup, utf8=True):
+    """stringCount 14 layout: +title-plus, road, gauge, start-up, title message, one more string,
+    then size / unknown / word table / two offsets (shifted with the size when the title changes)."""
+    head = bytes(1) + wolf.GAME_MAGIC
+    if utf8:
+        head = head[:9] + bytes([0x55])
+    ws = lambda t: wstr(t, "utf-8")
+    body = u32(2) + b"\x01\x02" + u32(14) + ws(title) + ws("0000-0000") + u32(0) + ws("MS Gothic") + ws("") * 3
+    body += ws("pc") + ws("ver") + ws("road.png") + ws("gauge.png") + ws(startup) + ws("") + ws("x")
+    tail_fixed = u32(7) + u32(2) + b"WWWW" + u32(1000) + u32(2000) + b"TAIL"
+    total = len(head) + len(body) + 4 + len(tail_fixed)
+    return head + body + u32(total - 1) + tail_fixed
 
 
 def game_dat(title, enc="cp932", encrypted=False):
@@ -121,7 +143,7 @@ def write(root, rel, data):
         f.write(data)
 
 
-def make_game(root, enc="cp932", db_encrypted=False, game_encrypted=False):
+def make_game(root, enc="cp932", db_encrypted=False, game_encrypted=False, utf8=False, features=3):
     m1 = mps([event(1, "村長", [page([
         cmd(101, [0], ["こんにちは。\n旅人さん。"], enc=enc),
         cmd(102, [0, 2], ["はい", "いいえ"], enc=enc),
@@ -131,15 +153,16 @@ def make_game(root, enc="cp932", db_encrypted=False, game_encrypted=False):
         cmd(103, [], ["作者メモ"], enc=enc),
         cmd(999, [], ["謎の命令"], enc=enc),
         cmd(101, [0], ["  "], enc=enc),
-    ], enc)], enc), event(2, "", [page([cmd(101, [0], ["二つ目"], enc=enc)], enc)], enc)])
-    m10 = mps([event(1, "x", [page([cmd(101, [0], ["地図十"], enc=enc)], enc)], enc)])
-    m2 = mps([event(1, "x", [page([cmd(101, [0], ["地図二"], enc=enc)], enc)], enc)])
+    ], enc, features)], enc), event(2, "", [page([cmd(101, [0], ["二つ目"], enc=enc)], enc, features)], enc)],
+        utf8=utf8, no_tiles=utf8)
+    m10 = mps([event(1, "x", [page([cmd(101, [0], ["地図十"], enc=enc)], enc, features)], enc)], utf8=utf8)
+    m2 = mps([event(1, "x", [page([cmd(101, [0], ["地図二"], enc=enc)], enc, features)], enc)], utf8=utf8)
     write(root, "Data/MapData/Map10.mps", m10)
     write(root, "Data/MapData/Map1.mps", m1)
     write(root, "Data/MapData/Map2.mps", m2)
     write(root, "Data/BasicData/CommonEvent.dat", common(
-        [(0, "共通", [cmd(101, [0], ["共通の台詞"], enc=enc)], "引数")], enc))
-    proj, dat = db_files(enc, db_encrypted)
+        [(0, "共通", [cmd(101, [0], ["共通の台詞"], enc=enc)], "引数")], enc, utf8))
+    proj, dat = db_files(enc, db_encrypted, utf8)
     write(root, "Data/BasicData/DataBase.project", proj)
     write(root, "Data/BasicData/DataBase.dat", dat)
     write(root, "Data/BasicData/Game.dat", game_dat("冒険の書", enc, game_encrypted))
@@ -200,7 +223,7 @@ class WolfTests(unittest.TestCase):
             ("dialogue", "地図二"), ("dialogue", "地図十"),   # natural sort: Map1, Map2, Map10
             ("dialogue", "共通の台詞"), ("script", "引数"), ("script", "選択肢"),
             ("name", "薬草"), ("desc", "傷を治す。\n少し。"), ("name", "毒消し"), ("desc", "毒を治す"),
-            ("other", "冒険の書"),
+            ("other", "冒険の書"), ("other", "1.0"),  # title, then title-plus (here the "1.0" string)
         ])
         self.assertEqual(lines[0].id, "Data/MapData/Map1.mps#e1/p0/c0/s0")
         self.assertEqual(lines[0].scene, "Map1/ev1:村長")
@@ -337,6 +360,102 @@ class WolfTests(unittest.TestCase):
         l.locator = {}
         with self.assertRaises(PatchError):
             r.apply(self.root, self.out, [l])
+
+    # -- real-game layout differences (Wolf 3.1x UTF-8 build)
+    def test_utf8_flagged_files_extract_like_plain(self):
+        make_game(self.root)
+        plain = [(l.kind, l.source) for l in self.extract()[1]]
+        shutil.rmtree(self.root)
+        make_game(self.root, enc="utf-8", utf8=True, features=4)
+        r, lines = self.extract()
+        self.assertEqual(r.warnings, [])
+        self.assertEqual([(l.kind, l.source) for l in lines], plain)
+        self.assertEqual(r.game_encoding, "utf-8")
+
+    def test_game_dat_14_strings_and_offsets(self):
+        write(self.root, "Data/BasicData/Game.dat", game_dat14("旧題名", "起動メッセージ"))
+        r, lines = self.extract()
+        self.assertEqual(r.warnings, [])
+        self.assertEqual([(l.id.split("#")[1], l.source) for l in lines],
+                         [("title", "旧題名"), ("titleplus", "ver"), ("startup", "起動メッセージ")])
+        old = rd(os.path.join(self.root, "Data/BasicData/Game.dat"))
+        lines[0].translation = "A much longer English title"
+        r.apply(self.root, self.out, lines)
+        new = rd(os.path.join(self.out, "Data/BasicData/Game.dat"))
+        diff = len(new) - len(old)
+        self.assertGreater(diff, 0)
+        szoff = lines[0].locator["szoff"]
+        self.assertEqual(int.from_bytes(new[szoff + diff:][:4], "little"), len(new) - 1)
+        io = lines[0].locator["ioff"]
+        self.assertEqual(int.from_bytes(new[io + diff:][:4], "little"), 1000 + diff)
+        self.assertEqual(int.from_bytes(new[io + diff + 4:][:4], "little"), 2000 + diff)
+        merged = os.path.join(self.tmp, "merged")
+        shutil.copytree(self.root, merged)
+        shutil.copyfile(os.path.join(self.out, "Data/BasicData/Game.dat"), os.path.join(merged, "Data/BasicData/Game.dat"))
+        r2 = wolf.Reader()
+        self.assertEqual(r2.extract(merged)[0].source, "A much longer English title")
+
+    def test_packed_map_is_a_warning_not_a_crash(self):
+        make_game(self.root)
+        data = bytearray(rd(os.path.join(self.root, "Data/MapData/Map1.mps")))
+        data[20] = 0x67  # version >= 0x65 = LZ4-packed body
+        write(self.root, "Data/MapData/Map1.mps", bytes(data))
+        r, lines = self.extract()
+        self.assertEqual(len(r.warnings), 1)
+        self.assertIn("LZ4", r.warnings[0][1])
+
+    # -- archives
+    def _archive_game(self, loose_map=None):
+        """A game root holding only Data/BasicData.wolf + Data/MapData.wolf (synthetic archives)."""
+        import test_wolfarchive as twa
+        src = os.path.join(self.tmp, "src")
+        make_game(src, enc="utf-8", utf8=True)
+        root = os.path.join(self.tmp, "arcgame")
+        os.makedirs(os.path.join(root, "Data"))
+        for stem in ("BasicData", "MapData"):
+            d = os.path.join(src, "Data", stem)
+            tree = {f: rd(os.path.join(d, f)) for f in os.listdir(d)}
+            write(root, "Data/%s.wolf" % stem, twa.build_archive(tree, keystring=wolf.wolfarchive.WOLF_KEYS[0x13A], mode="mix"))
+        write(root, "Data/BGM.wolf", b"junk")
+        return src, root
+
+    def test_archive_only_game(self):
+        wolf.WORK_ROOT = os.path.join(self.tmp, "work")
+        src, root = self._archive_game()
+        before = sorted(os.listdir(os.path.join(root, "Data")))
+        self.assertEqual(wolf.archive_status(root), "archive")
+        self.assertTrue(wolf.Reader.detect(root))
+        r = wolf.Reader()
+        lines = r.extract(root)
+        ref = wolf.Reader().extract(src)
+        self.assertEqual([(l.id, l.kind, l.source) for l in lines], [(l.id, l.kind, l.source) for l in ref])
+        self.assertEqual(r.warnings, [("BGM.wolf", "archive: not a DXA archive")])  # junk archive is reported
+        self.assertEqual(sorted(os.listdir(os.path.join(root, "Data"))), before)  # game folder untouched
+        self.assertTrue(os.path.isdir(wolf.WORK_ROOT))
+        # apply: reads from the archive extraction, writes LOOSE paths under out_root only
+        for l in lines:
+            if l.kind == "dialogue":
+                l.translation = "EN " + l.source
+        written = r.apply(root, self.out, lines)
+        self.assertTrue(written)
+        for rel in written:
+            self.assertTrue(rel.startswith("Data/MapData/") or rel.startswith("Data/BasicData/"), rel)
+            self.assertTrue(os.path.isfile(os.path.join(self.out, *rel.split("/"))))
+        self.assertEqual(sorted(os.listdir(os.path.join(root, "Data"))), before)
+        # loose files now shadow the archives
+        for rel in written:
+            write(root, rel, rd(os.path.join(self.out, *rel.split("/"))))
+        r2 = wolf.Reader()
+        again = r2.extract(root)
+        self.assertEqual(len(again), len(lines))
+        self.assertTrue(any(l.source.startswith("EN ") for l in again))
+        self.assertEqual(wolf.archive_status(root), "extracted")
+
+    def test_unreadable_archive_stays_archive_encrypted(self):
+        os.makedirs(os.path.join(self.root, "Data"))
+        write(self.root, "Data/BasicData.wolf", b"DX" + bytes(80))
+        self.assertEqual(wolf.archive_status(self.root), "archive-encrypted")
+        self.assertFalse(wolf.Reader.detect(self.root))
 
 
 if __name__ == "__main__":

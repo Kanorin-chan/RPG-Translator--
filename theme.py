@@ -1,163 +1,218 @@
 # -*- coding: utf-8 -*-
-"""Dark visual theme for the Eroge Translator control UI.
+"""Visual theme for RPG-Translator: one neutral palette + ONE accent, system font.
 
-Presentation only — NO app logic. ui.py calls apply_theme(root) once at startup
-to install a dark, light-blue-accented ttk theme (base 'clam'), and uses the
-returned palette/fonts to style the few non-ttk (tk) widgets it owns (the drop
-zones, the ScrolledText feed/log, the status bar). enable_dark_titlebar(root)
-best-effort darkens the Windows 11 title bar.
-
-Stdlib only.
+Presentation only. apply_theme(root, mode) installs a ttk theme (base 'clam') and
+returns (palette, fonts) for the few classic-tk widgets (Text, status bar).
+mode is "dark" or "light"; switching needs a restart (tk widgets are coloured at
+creation). Stdlib only.
 """
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 
-PALETTE = {
-    "bg":            "#1e1f26",
-    "surface":       "#2a2b34",
-    "surface_alt":   "#33343f",
-    "border":        "#3a3c47",
-    "text":          "#e6e6ea",
-    "text_muted":    "#9aa0ac",
-    "accent":        "#5aa9e6",
-    "accent_active": "#7cbcf0",
-    "accent_fg":     "#10131a",
-    "success":       "#5cc98d",
-    "danger":        "#e06a6a",
-    "danger_active": "#ef8080",
-    "drop_idle":     "#262832",
-    "drop_hover":    "#2f3a48",
+PALETTES = {
+    "dark": {
+        "bg": "#202124", "surface": "#292a2e", "surface_alt": "#323338",
+        "border": "#44464c", "text": "#e6e7e9", "text_muted": "#9b9ea6",
+        "accent": "#4c8fdd", "accent_active": "#6aa3e8", "accent_fg": "#ffffff",
+        "success": "#5fb37c", "danger": "#e0716f", "danger_active": "#ee8a88",
+        "drop_idle": "#292a2e", "drop_hover": "#2c3646",
+        "select": "#34517c", "stripe": "#2d2e33",
+    },
+    "light": {
+        "bg": "#f1f1f2", "surface": "#ffffff", "surface_alt": "#e6e7e9",
+        "border": "#c6c8cd", "text": "#1d1e20", "text_muted": "#62666e",
+        "accent": "#2b6cc4", "accent_active": "#3d7fd8", "accent_fg": "#ffffff",
+        "success": "#2f8a52", "danger": "#c03a38", "danger_active": "#d04e4c",
+        "drop_idle": "#ffffff", "drop_hover": "#e3edfa",
+        "select": "#cfe0f7", "stripe": "#f6f6f7",
+    },
 }
-
-FONTS = {
-    "base":    ("Segoe UI", 10),
-    "heading": ("Segoe UI", 11, "bold"),
-    "small":   ("Segoe UI", 9),
-    "big":     ("Segoe UI", 12),
-    "mono":    ("Consolas", 9),
-}
+PALETTE = dict(PALETTES["dark"])   # back-compat; updated by apply_theme
+FONTS = {}                   # filled by apply_theme (system font)
 
 
-def apply_theme(root):
-    """Install the dark theme on `root`. Returns (palette, fonts)."""
-    p, f = PALETTE, FONTS
+def _fonts(root):
+    base = tkfont.nametofont("TkDefaultFont").actual()
+    fam, size = base["family"], abs(int(base["size"])) or 9
+    mono = "Consolas" if "Consolas" in tkfont.families(root) else "Courier New"
+    FONTS.update({
+        "base": (fam, size), "small": (fam, size), "big": (fam, size + 2),
+        "heading": (fam, size, "bold"), "title": (fam, size + 4, "bold"),
+        "mono": (mono, size),
+    })
+    return FONTS
+
+
+def apply_theme(root, mode="dark"):
+    """Install the theme on `root`. Returns (palette, fonts)."""
+    p = dict(PALETTES.get(mode, PALETTES["dark"]))
+    PALETTE.clear()
+    PALETTE.update(p)
+    f = _fonts(root)
     root.configure(background=p["bg"])
-
     style = ttk.Style(root)
     try:
-        style.theme_use("clam")   # most restyle-able built-in ttk theme
+        style.theme_use("clam")
     except tk.TclError:
         pass
 
     style.configure(".", background=p["bg"], foreground=p["text"],
                     fieldbackground=p["surface"], bordercolor=p["border"],
-                    focuscolor=p["accent"], font=f["base"])
+                    lightcolor=p["border"], darkcolor=p["border"],
+                    focuscolor=p["accent"], troughcolor=p["surface_alt"],
+                    selectbackground=p["select"], selectforeground=p["text"],
+                    font=f["base"])
+    style.map(".", foreground=[("disabled", p["text_muted"])])
     style.configure("TFrame", background=p["bg"])
+    style.configure("Surface.TFrame", background=p["surface"])
+    style.configure("Bar.TFrame", background=p["surface_alt"])
     style.configure("TLabel", background=p["bg"], foreground=p["text"])
-    style.configure("Heading.TLabel", background=p["bg"],
-                    foreground=p["text"], font=f["heading"])
-    style.configure("Muted.TLabel", background=p["bg"],
-                    foreground=p["text_muted"], font=f["small"])
+    style.configure("Muted.TLabel", foreground=p["text_muted"])
+    style.configure("Title.TLabel", font=f["title"])
+    style.configure("Heading.TLabel", font=f["heading"])
+    style.configure("Bar.TLabel", background=p["surface_alt"],
+                    foreground=p["text_muted"])
+    style.configure("Danger.TLabel", foreground=p["danger"])
+    # legacy names used by older code / tests
+    style.configure("Card.TFrame", background=p["bg"])
+    style.configure("Card.TLabel", background=p["bg"], foreground=p["text"])
+    style.configure("CardMuted.TLabel", background=p["bg"],
+                    foreground=p["text_muted"])
 
-    # widgets that live INSIDE a card (surface bg) need matching backgrounds
-    style.configure("Card.TFrame", background=p["surface"])
-    style.configure("Card.TLabel", background=p["surface"], foreground=p["text"])
-    style.configure("CardMuted.TLabel", background=p["surface"],
-                    foreground=p["text_muted"], font=f["small"])
-
-    # notebook + tabs
-    style.configure("TNotebook", background=p["bg"], borderwidth=0,
-                    tabmargins=(6, 6, 6, 0))
-    style.configure("TNotebook.Tab", background=p["bg"],
-                    foreground=p["text_muted"], padding=(20, 10),
-                    borderwidth=0, font=f["base"])
-    style.map("TNotebook.Tab",
-              background=[("selected", p["surface"])],
-              foreground=[("selected", p["accent"]), ("active", p["text"])])
+    # sidebar navigation (radio toolbuttons)
+    style.configure("Nav.TFrame", background=p["surface_alt"])
+    style.configure("Nav.Toolbutton", background=p["surface_alt"],
+                    foreground=p["text"], anchor="w", padding=(14, 8),
+                    borderwidth=0, relief="flat", font=f["base"])
+    style.map("Nav.Toolbutton",
+              background=[("selected", p["bg"]), ("active", p["border"])],
+              foreground=[("selected", p["accent"])])
 
     # buttons
     style.configure("TButton", background=p["surface_alt"], foreground=p["text"],
-                    borderwidth=0, padding=(12, 7), font=f["base"])
+                    bordercolor=p["border"], padding=(10, 4), relief="flat",
+                    borderwidth=1, anchor="center")
     style.map("TButton",
-              background=[("active", p["border"]), ("disabled", p["surface"])],
-              foreground=[("disabled", p["text_muted"])])
+              background=[("disabled", p["surface"]), ("pressed", p["border"]),
+                          ("active", p["border"])],
+              bordercolor=[("focus", p["accent"])])
     style.configure("Accent.TButton", background=p["accent"],
-                    foreground=p["accent_fg"], font=f["heading"], padding=(14, 7))
+                    foreground=p["accent_fg"], bordercolor=p["accent"])
     style.map("Accent.TButton",
-              background=[("active", p["accent_active"]),
-                          ("disabled", p["surface_alt"])],
-              foreground=[("disabled", p["text_muted"])])
-    style.configure("Secondary.TButton", background=p["surface_alt"],
-                    foreground=p["text"])
-    style.map("Secondary.TButton",
-              background=[("active", p["border"]), ("disabled", p["surface"])],
-              foreground=[("disabled", p["text_muted"])])
-    style.configure("Danger.TButton", background=p["surface_alt"],
-                    foreground=p["danger"])
+              background=[("disabled", p["surface"]),
+                          ("active", p["accent_active"])],
+              foreground=[("disabled", p["text_muted"])],
+              bordercolor=[("disabled", p["border"])])
+    style.configure("Secondary.TButton")
+    style.configure("Danger.TButton", foreground=p["danger"])
     style.map("Danger.TButton",
-              background=[("active", p["border"]), ("disabled", p["surface"])],
-              foreground=[("active", p["danger_active"]),
-                          ("disabled", p["text_muted"])])
+              foreground=[("disabled", p["text_muted"]),
+                          ("active", p["danger_active"])])
+    style.configure("Toolbar.TButton", padding=(10, 4))
 
-    # entry / combobox
-    style.configure("TEntry", fieldbackground=p["surface"], foreground=p["text"],
-                    bordercolor=p["border"], insertcolor=p["text"], padding=6)
-    style.map("TEntry", foreground=[("readonly", p["text_muted"])])
-    style.configure("TCombobox", fieldbackground=p["surface"],
-                    background=p["surface_alt"], foreground=p["text"],
-                    arrowcolor=p["text"], bordercolor=p["border"], padding=5)
+    # inputs
+    for name in ("TEntry", "TSpinbox", "TCombobox"):
+        style.configure(name, fieldbackground=p["surface"], foreground=p["text"],
+                        insertcolor=p["text"], bordercolor=p["border"],
+                        padding=3)
+    style.map("TEntry", fieldbackground=[("readonly", p["surface_alt"]),
+                                         ("disabled", p["bg"])],
+              bordercolor=[("focus", p["accent"])])
     style.map("TCombobox", fieldbackground=[("readonly", p["surface"])],
-              foreground=[("readonly", p["text"])])
-    # combobox drop-down list is a classic tk Listbox: colour it via options
+              foreground=[("readonly", p["text"])],
+              bordercolor=[("focus", p["accent"])])
+    style.configure("TCombobox", background=p["surface_alt"],
+                    arrowcolor=p["text"])
+    style.configure("TSpinbox", background=p["surface_alt"], arrowcolor=p["text"])
     root.option_add("*TCombobox*Listbox.background", p["surface"])
     root.option_add("*TCombobox*Listbox.foreground", p["text"])
     root.option_add("*TCombobox*Listbox.selectBackground", p["accent"])
     root.option_add("*TCombobox*Listbox.selectForeground", p["accent_fg"])
+    root.option_add("*Listbox.background", p["surface"])
+    root.option_add("*Listbox.foreground", p["text"])
+    root.option_add("*Listbox.selectBackground", p["select"])
+    root.option_add("*Listbox.selectForeground", p["text"])
 
-    # progressbar
+    style.configure("TCheckbutton", background=p["bg"], indicatorcolor=p["surface"],
+                    indicatorbackground=p["surface"])
+    style.map("TCheckbutton", indicatorcolor=[("selected", p["accent"])],
+              background=[("active", p["bg"])])
+    style.configure("TRadiobutton", background=p["bg"])
+    style.map("TRadiobutton", indicatorcolor=[("selected", p["accent"])],
+              background=[("active", p["bg"])])
+
+    # tables
+    style.configure("Treeview", background=p["surface"], fieldbackground=p["surface"],
+                    foreground=p["text"], bordercolor=p["border"], rowheight=22,
+                    borderwidth=1)
+    style.map("Treeview", background=[("selected", p["select"])],
+              foreground=[("selected", p["text"])])
+    style.configure("Treeview.Heading", background=p["surface_alt"],
+                    foreground=p["text"], relief="flat", padding=(6, 4),
+                    font=f["heading"])
+    style.map("Treeview.Heading", background=[("active", p["border"])])
+
+    style.configure("TScrollbar", background=p["surface_alt"], troughcolor=p["bg"],
+                    bordercolor=p["bg"], arrowcolor=p["text_muted"], relief="flat")
+    style.map("TScrollbar", background=[("active", p["border"])])
     style.configure("TProgressbar", background=p["accent"],
-                    troughcolor=p["surface"], bordercolor=p["surface"],
-                    lightcolor=p["accent"], darkcolor=p["accent"])
-
-    # cards
-    style.configure("Card.TLabelframe", background=p["surface"],
-                    bordercolor=p["border"], relief="flat", borderwidth=1,
-                    padding=12)
-    style.configure("Card.TLabelframe.Label", background=p["surface"],
-                    foreground=p["accent"], font=f["heading"])
-
+                    troughcolor=p["surface_alt"], bordercolor=p["border"],
+                    lightcolor=p["accent"], darkcolor=p["accent"], thickness=10)
     style.configure("TSeparator", background=p["border"])
+
+    # inner notebook + group boxes
+    style.configure("TNotebook", background=p["bg"], bordercolor=p["border"],
+                    tabmargins=(0, 0, 0, 0))
+    style.configure("TNotebook.Tab", background=p["bg"], foreground=p["text_muted"],
+                    padding=(14, 5), bordercolor=p["border"], lightcolor=p["border"],
+                    darkcolor=p["border"], focuscolor=p["surface_alt"])
+    style.map("TNotebook.Tab",
+              background=[("selected", p["surface_alt"])],
+              foreground=[("selected", p["text"])])
+    for name in ("TLabelframe", "Card.TLabelframe", "Drop.TLabelframe"):
+        style.configure(name, background=p["bg"], bordercolor=p["border"],
+                        relief="solid", borderwidth=1, padding=8)
+    style.configure("DropHover.TLabelframe", background=p["drop_hover"],
+                    bordercolor=p["accent"], relief="solid", borderwidth=1,
+                    padding=8)
+    for name in ("TLabelframe.Label", "Card.TLabelframe.Label",
+                 "Drop.TLabelframe.Label"):
+        style.configure(name, background=p["bg"], foreground=p["text"],
+                        font=f["heading"])
+    style.configure("DropHover.TLabelframe.Label", background=p["drop_hover"],
+                    foreground=p["text"], font=f["heading"])
+    style.configure("Sash", sashthickness=6)
     return p, f
 
 
-def enable_dark_titlebar(root):
+def style_text(w, p, f):
+    """Colour a classic tk Text / ScrolledText to the palette."""
+    w.config(bg=p["surface"], fg=p["text"], insertbackground=p["text"],
+             selectbackground=p["select"], selectforeground=p["text"],
+             relief="flat", borderwidth=0, highlightthickness=1,
+             highlightbackground=p["border"], highlightcolor=p["accent"],
+             font=f["mono"], padx=6, pady=4)
+
+
+def enable_dark_titlebar(root, dark=True):
     r"""Best-effort dark Windows title bar. No-op off Windows or on failure.
-
-    Must run AFTER the window is mapped (see the root.after(...) call in
-    ui.App.__init__) — DWM ignores the attribute on an unmapped window. We set
-    both attribute ids (20 = Win11/late-Win10, 19 = early builds) and force a
-    non-client repaint so the frame recolours immediately.
-
-    NOTE: even when the DWM call returns S_OK, Windows keeps the title bar in the
-    user's ACCENT colour if Settings > Personalization > Colors > "Show accent
-    colour on title bars" is ON (registry HKCU\...\DWM\ColorPrevalence = 1). That
-    user setting overrides an app's dark-title-bar request by design; the client
-    area is still fully themed. Not a bug — don't try to fight it."""
+    Runs after the window is mapped. Windows keeps the accent colour when
+    'Show accent colour on title bars' is on; that is a user setting, not a bug."""
     if not sys.platform.startswith("win"):
         return
     try:
         import ctypes
         root.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        val = ctypes.c_int(1)
-        for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE (build-dependent)
+        val = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):
             try:
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
             except Exception:
                 pass
-        # Force the title bar (non-client area) to repaint with the new colour.
         if root.winfo_viewable():
             root.withdraw()
             root.deiconify()

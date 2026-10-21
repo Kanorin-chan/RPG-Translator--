@@ -235,6 +235,56 @@ class TestMV(Base):
         self.assertEqual(l.source, "\\N[1]は\\C[2]赤\\C[0]")
 
 
+class TestNameTag(Base):
+    def setUp(self):
+        super().setUp()
+        self.p = os.path.join(self.root, *(self.pre + "CommonEvents.json").split("/"))
+        d = jload(self.p)
+        d[1]["list"] = (msg(["\\N<白築 エル>おはよう", "二行目"]) + msg(["\\N<桐島 \\N[1]>んお～"])
+                        + msg(["タグなし"]) + msg(["\\N<>空名"]) + msg(["\\N<エル>"]) + [cmd(0)])
+        dump(self.p, d, "lines")
+        self.ls = [l for l in R.extract(self.root) if l.file.endswith("CommonEvents.json")]
+
+    def test_split(self):
+        a, b, c, d, e = self.ls
+        self.assertEqual((a.speaker, a.source, a.locator["tag"]), ("白築 エル", "おはよう\n二行目", "\\N<白築 エル>"))
+        self.assertEqual((b.speaker, b.source), ("桐島 \\N[1]", "んお～"))
+        for x in (c, d, e):  # untagged, empty name, tag-only: left whole
+            self.assertNotIn("tag", x.locator)
+            self.assertEqual(x.speaker, "")
+        self.assertEqual(d.source, "\\N<>空名")
+
+    def test_ids_stable_and_identity(self):
+        self.assertEqual([l.id for l in self.ls], [l.id for l in R.extract(self.root)
+                                                    if l.file.endswith("CommonEvents.json")])
+        self.assertEqual(R.apply(self.root, self.out, R.extract(self.root)), [])
+
+    def test_apply_restores_tag(self):
+        a, b, c = self.ls[:3]
+        a.translation = "早安\n第二行"
+        a.locator["speaker_tr"] = "白築 艾露"
+        b.translation = "嗯哦～"
+        b.locator["speaker_tr"] = "桐島 \\N[1]"
+        c.translation = "無標籤"
+        R.apply(self.root, self.out, self.ls)
+        lst = json.loads(read(self.out, self.pre + "CommonEvents.json"))[1]["list"]
+        got = [x["parameters"][0] for x in lst if x["code"] == 401]
+        self.assertEqual(got[:4], ["\\N<白築 艾露>早安", "第二行", "\\N<桐島 \\N[1]>嗯哦～", "無標籤"])
+
+    def test_apply_without_speaker_tr_keeps_original_tag(self):
+        a = self.ls[0]
+        a.translation = "早安"
+        R.apply(self.root, self.out, self.ls)
+        lst = json.loads(read(self.out, self.pre + "CommonEvents.json"))[1]["list"]
+        self.assertEqual(lst[1]["parameters"][0], "\\N<白築 エル>早安")
+
+    def test_stale_when_tag_changed(self):
+        a = self.ls[0]
+        a.translation, a.locator["tag"] = "x", "\\N<別人>"
+        with self.assertRaises(PatchError):
+            R.apply(self.root, self.out, self.ls)
+
+
 class TestMZ(Base):
     mz = True
 

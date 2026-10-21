@@ -1,792 +1,353 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Eroge Translator — native desktop control UI.
+RPG-Translator — desktop control UI (Tkinter + ttk, no web server).
 
-A thin Tkinter front-end over the existing toolkit. Two tabs:
+Shell only: sidebar navigation, page stack, status bar, one work queue, and the
+shared state (settings, current project, providers). The pages hold the logic:
 
-  * Translate — pick/drop an MTool-exported JSON, choose a target language, run
-    the offline batch translator (translate.run_translation) on a worker thread,
-    watch progress + a live source->translation feed, open the output folder.
-  * XUnity — start/stop the live translation server (server.py), pick/drop a
-    Unity game folder, detect its engine/arch + applied state, and
-    install / re-apply / reconfigure / uninstall the XUnity patch, all streamed
-    into one combined log alongside the live server feed.
+  pages_projects  open a game, extract, translate, patch, roll back
+  review_page     review list (optional module; placeholder if missing)
+  pages_providers provider profiles, connection test, concurrency probe
+  pages_xunity    offline MTool translate + XUnity server/install wizard
+  pages_settings  language, mode, context, batch, theme, folders
 
-Design rules honored here:
-  * NO translation logic lives here — it drives core/translate/install_game.
-  * Long jobs run on WORKER THREADS. Tk widgets are touched ONLY from the main
-    thread; workers hand updates back through a queue.Queue polled with after().
-    The window must never freeze.
-  * Drag-drop yields a real filesystem PATH (via tkinterdnd2), never an upload.
+Rules: no translation logic here; slow work runs on worker threads and reports
+through App.post() -> queue -> App._poll_queue() (main thread only touches Tk).
 
-Run (Windows):  PYTHONUTF8=1 python3 ui.py
+Run (Windows):  PYTHONUTF8=1 python ui.py
 """
 
 import os
 import queue
-import subprocess
+import re
 import sys
 import threading
-import time
+import traceback
 
 import tkinter as tk
-from tkinter import filedialog, ttk
-from tkinter import scrolledtext
+from tkinter import ttk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import core            # noqa: E402
-import translate       # noqa: E402
-import install_game    # noqa: E402
+import providers       # noqa: E402
 import theme           # noqa: E402
+from app_common import (LANG_BY_LABEL, LANG_CHOICES, load_ui_state,  # noqa: E402,F401
+                        save_ui_state)
 
-# tkinterdnd2 is the drag-drop provider. Import is guarded so a broken install
-# degrades to Browse-only rather than crashing the app on startup.
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
+try:  # tkinterdnd2 is optional: without it the app is Browse-only
+    from tkinterdnd2 import TkinterDnD
     _DND_IMPORTED = True
-except Exception as _e:  # pragma: no cover - environment dependent
+except Exception:  # pragma: no cover - environment dependent
     TkinterDnD = None
-    DND_FILES = None
     _DND_IMPORTED = False
-    _DND_IMPORT_ERR = _e
 
-# Windows: launch the server child process without popping a console window.
-_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-# Target-language choices: (menu label, config target_language, XUnity lang code)
-LANG_CHOICES = [
-    ("Traditional Chinese", "Traditional Chinese", "zh-Hant"),
-    ("Simplified Chinese", "Simplified Chinese", "zh-Hans"),
-    ("English", "English", "en"),
-]
-_LANG_BY_LABEL = {c[0]: c for c in LANG_CHOICES}
-
-MAX_FEED_LINES = 500  # cap the live-feed / log widgets so long jobs stay light
+APP_TITLE = "RPG-Translator"
+PAGES = [("projects", "Projects"), ("review", "Review"), ("providers", "Providers"),
+         ("xunity", "XUnity / MTool"), ("settings", "Settings")]
+MSGS_PER_TICK = 300
 
 
 def create_root():
-    """Build the Tk root, preferring TkinterDnD (drag-drop). Returns
-    (root, dnd_ok). Never raises just because drag-drop is unavailable."""
+    """Tk root, preferring TkinterDnD. Returns (root, dnd_ok); never raises for DnD."""
     if _DND_IMPORTED:
         try:
             return TkinterDnD.Tk(), True
-        except Exception as e:  # pragma: no cover - environment dependent
+        except Exception as e:  # pragma: no cover
             sys.stderr.write("tkinterdnd2 init failed; drag-drop disabled: %r\n" % e)
     return tk.Tk(), False
 
 
-class App:
-    """The whole control UI. Construct with a Tk root and a dnd_ok flag."""
+def default_settings():
+    cfg = {}
+    try:
+        cfg = core.load_config()
+    except Exception:
+        pass
+    lang = cfg.get("target_language", "Traditional Chinese")
+    if lang not in LANG_BY_LABEL:
+        lang = LANG_CHOICES[0][0]
+    return {
+        "target_language": lang, "mode": cfg.get("mode", "dynamic"),
+        "context_window": int(cfg.get("context_window", 4)),
+        "batch_size": int(cfg.get("batch_size", 40)),
+        "theme": "dark", "projects_dir": "", "backups_dir": "",
+        "default_provider": "",
+    }
 
-    def __init__(self, root, dnd_ok):
+
+class App:
+    """The whole UI. Construct with a Tk root and a dnd_ok flag."""
+
+    def __init__(self, root, dnd_ok, start_threads=True):
         self.root = root
         self.dnd_ok = dnd_ok
         self.q = queue.Queue()
+        self._handlers = {}
+        self._flush_hooks = []
+        self.project = None
+        self.project_path = None
+        self.provider_items = []          # filled by ProvidersPage, shared by reference
+        self.projects = self.review = self.providers_page = None
+        self.xunity = self.settings_page = None
 
-        # --- translate-tab runtime state ---
-        self.translate_path = None
-        self.translate_stop = None
-        self.translate_running = False
-        self.translate_t0 = 0.0
-        self.translate_out_path = None
+        self.ui_state = load_ui_state()
+        self.settings = default_settings()
+        saved = self.ui_state.get("settings")
+        if isinstance(saved, dict):
+            self.settings.update({k: v for k, v in saved.items() if k in self.settings})
 
-        # --- xunity-tab runtime state ---
-        self.server_proc = None
-        self.server_up = False
-        self.game_root = None
-        self.game_detect = None
-        self._stop_health = threading.Event()
+        root.title(APP_TITLE)
+        self.palette, self.fonts = theme.apply_theme(root, self.settings["theme"])
+        self._apply_geometry()
+        self._after_ids = [root.after(60, lambda: theme.enable_dark_titlebar(
+            root, self.settings["theme"] == "dark"))]
 
-        cfg = core.load_config()
-        self.host = cfg.get("xunity_host", "127.0.0.1")
-        self.port = int(cfg.get("xunity_port", 4404))
+        self.status_action_var = tk.StringVar(value="ready")
+        self.status_server_var = tk.StringVar(value="XUnity server: stopped")
+        self.status_project_var = tk.StringVar(value="no project")
+        self._build_shell()
+        self._build_pages(start_threads)
+        self.show_page(self.ui_state.get("page") if self.ui_state.get("page") in dict(PAGES)
+                       else "projects")
 
-        root.title("Eroge Translator")
-        self.palette, self.fonts = theme.apply_theme(root)
-        root.geometry("900x780")
-        root.minsize(760, 620)
-        # DWM ignores the dark-title-bar attribute until the window is mapped,
-        # so apply it after the event loop has shown the window.
-        root.after(60, lambda: theme.enable_dark_titlebar(root))
-
-        self._build_notebook()
-        self._build_status_line()
-
-        # start the pumps (these only schedule; they run under mainloop)
-        root.after(80, self._poll_queue)
-        self._start_health_thread()
-        root.after(300, self._refresh_health_once)
-
+        for i, (key, _) in enumerate(PAGES, 1):
+            root.bind("<Control-Key-%d>" % i, lambda e, k=key: self.show_page(k))
+        self._after_ids.append(root.after(80, self._poll_queue))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------------------------------------------ #
-    # layout
-    # ------------------------------------------------------------------ #
-    def _build_notebook(self):
-        self.nb = ttk.Notebook(self.root)
-        self.tab_translate = ttk.Frame(self.nb, padding=10)
-        self.tab_xunity = ttk.Frame(self.nb, padding=10)
-        self.nb.add(self.tab_translate, text="  Translate  ")
-        self.nb.add(self.tab_xunity, text="  XUnity  ")
-        self.nb.pack(side="top", fill="both", expand=True)
-        self._build_translate_tab(self.tab_translate)
-        self._build_xunity_tab(self.tab_xunity)
-
-    def _build_status_line(self):
-        p = self.palette
-        bar = tk.Frame(self.root, bg=p["surface_alt"])
-        bar.pack(side="bottom", fill="x")
-        inner = tk.Frame(bar, bg=p["surface_alt"])
-        inner.pack(fill="x", padx=10, pady=5)
-        self.status_server_var = tk.StringVar(value="○ Server stopped")
-        self.status_action_var = tk.StringVar(value="idle")
-        self.status_server_lbl = tk.Label(
-            inner, textvariable=self.status_server_var, bg=p["surface_alt"],
-            fg=p["text_muted"], font=self.fonts["small"])
-        self.status_server_lbl.pack(side="left")
-        tk.Label(inner, text="│", bg=p["surface_alt"], fg=p["border"]).pack(
-            side="left", padx=8)
-        tk.Label(inner, textvariable=self.status_action_var, bg=p["surface_alt"],
-                 fg=p["text_muted"], font=self.fonts["small"]).pack(side="left")
-        if not self.dnd_ok:
-            tk.Label(inner, text="(drag-drop unavailable — use Browse)",
-                     bg=p["surface_alt"], fg=p["danger"],
-                     font=self.fonts["small"]).pack(side="right")
-
-    # ---- Tab 1: Translate -------------------------------------------- #
-    def _build_translate_tab(self, parent):
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
-
-        # --- Input card ---
-        input_card = self._card(parent, "  Input  ")
-        input_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        input_card.columnconfigure(0, weight=1)
-        self.t_drop = self._make_dropzone(
-            input_card, "⬇\n\nDrop an MTool .json here", self._on_drop_translate)
-        self.t_drop.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        pathrow = ttk.Frame(input_card, style="Card.TFrame")
-        pathrow.grid(row=1, column=0, sticky="ew")
-        pathrow.columnconfigure(0, weight=1)
-        self.t_path_var = tk.StringVar(value="(no file selected)")
-        ttk.Entry(pathrow, textvariable=self.t_path_var, state="readonly").grid(
-            row=0, column=0, sticky="ew")
-        ttk.Button(pathrow, text="Browse…", style="Secondary.TButton",
-                   command=self._browse_translate).grid(row=0, column=1, padx=(8, 0))
-
-        # --- Options card ---
-        opt_card = self._card(parent, "  Options  ")
-        opt_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(opt_card, text="Target language", style="Card.TLabel").pack(
-            side="left")
-        self.t_lang_var = tk.StringVar(value=LANG_CHOICES[0][0])
-        ttk.Combobox(opt_card, textvariable=self.t_lang_var, state="readonly",
-                     width=22, values=[c[0] for c in LANG_CHOICES]).pack(
-            side="left", padx=(8, 16))
-        self.t_run_btn = ttk.Button(opt_card, text="Translate",
-                                    style="Accent.TButton",
-                                    command=self._start_translate)
-        self.t_run_btn.pack(side="left")
-        self.t_stop_btn = ttk.Button(opt_card, text="Stop", state="disabled",
-                                     style="Danger.TButton",
-                                     command=self._stop_translate)
-        self.t_stop_btn.pack(side="left", padx=(8, 0))
-        self.t_open_btn = ttk.Button(opt_card, text="Open output folder",
-                                     state="disabled", style="Secondary.TButton",
-                                     command=self._open_output_folder)
-        self.t_open_btn.pack(side="right")
-
-        # --- Progress & Feed card ---
-        feed_card = self._card(parent, "  Progress & Feed  ")
-        feed_card.grid(row=2, column=0, sticky="nsew")
-        feed_card.columnconfigure(0, weight=1)
-        feed_card.rowconfigure(2, weight=1)
-        self.t_prog = ttk.Progressbar(feed_card, mode="determinate", maximum=100)
-        self.t_prog.grid(row=0, column=0, sticky="ew")
-        self.t_prog_var = tk.StringVar(value="")
-        ttk.Label(feed_card, textvariable=self.t_prog_var,
-                  style="CardMuted.TLabel").grid(row=1, column=0, sticky="w",
-                                                 pady=(4, 6))
-        self.t_feed = scrolledtext.ScrolledText(feed_card, height=14, wrap="none",
-                                                state="disabled")
-        self.t_feed.grid(row=2, column=0, sticky="nsew")
-        self._style_text_widget(self.t_feed)
-
-    # ---- Tab 2: XUnity ----------------------------------------------- #
-    def _build_xunity_tab(self, parent):
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(3, weight=1)
-
-        # --- Server card ---
-        srv = self._card(parent, "  Live translation server  ")
-        srv.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        self.x_srv_status = tk.StringVar(value="○ stopped")
-        ttk.Label(srv, textvariable=self.x_srv_status, width=14,
-                  style="Card.TLabel").pack(side="left")
-        self.x_srv_start = ttk.Button(srv, text="Start", style="Accent.TButton",
-                                      command=self._start_server)
-        self.x_srv_start.pack(side="left", padx=(0, 6))
-        self.x_srv_stop = ttk.Button(srv, text="Stop", state="disabled",
-                                     style="Danger.TButton",
-                                     command=self._stop_server)
-        self.x_srv_stop.pack(side="left")
-        ttk.Label(srv, text="http://%s:%d" % (self.host, self.port),
-                  style="CardMuted.TLabel").pack(side="right")
-
-        # --- Game card ---
-        game = self._card(parent, "  Game  ")
-        game.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        game.columnconfigure(0, weight=1)
-        self.x_drop = self._make_dropzone(
-            game, "⬇\n\nDrop a Unity game folder here", self._on_drop_game)
-        self.x_drop.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        gpath = ttk.Frame(game, style="Card.TFrame")
-        gpath.grid(row=1, column=0, sticky="ew")
-        gpath.columnconfigure(0, weight=1)
-        self.x_path_var = tk.StringVar(value="(no game selected)")
-        ttk.Entry(gpath, textvariable=self.x_path_var, state="readonly").grid(
-            row=0, column=0, sticky="ew")
-        ttk.Button(gpath, text="Browse…", style="Secondary.TButton",
-                   command=self._browse_game).grid(row=0, column=1, padx=(8, 0))
-        detrow = ttk.Frame(game, style="Card.TFrame")
-        detrow.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        self.x_detect_var = tk.StringVar(value="No game selected.")
-        ttk.Label(detrow, textvariable=self.x_detect_var,
-                  style="Card.TLabel").pack(side="left")
-        ttk.Label(detrow, text="Language", style="CardMuted.TLabel").pack(
-            side="right", padx=(0, 6))
-        self.x_lang_var = tk.StringVar(value=LANG_CHOICES[0][0])
-        ttk.Combobox(detrow, textvariable=self.x_lang_var, state="readonly",
-                     width=20, values=[c[0] for c in LANG_CHOICES]).pack(
-            side="right")
-
-        # --- Actions card ---
-        act = self._card(parent, "  Actions  ")
-        act.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        self.x_install_btn = ttk.Button(
-            act, text="Install", state="disabled", style="Accent.TButton",
-            command=lambda: self._game_action("install"))
-        self.x_reapply_btn = ttk.Button(
-            act, text="Re-apply (redo)", state="disabled", style="Secondary.TButton",
-            command=lambda: self._game_action("install"))
-        self.x_reconf_btn = ttk.Button(
-            act, text="Reconfigure only", state="disabled",
-            style="Secondary.TButton",
-            command=lambda: self._game_action("reconfigure"))
-        self.x_uninstall_btn = ttk.Button(
-            act, text="Uninstall", state="disabled", style="Danger.TButton",
-            command=lambda: self._game_action("uninstall"))
-        for b in (self.x_install_btn, self.x_reapply_btn, self.x_reconf_btn,
-                  self.x_uninstall_btn):
-            b.pack(side="left", padx=(0, 6))
-
-        # --- Log card ---
-        logc = self._card(parent,
-                          "  Activity log (install steps + live server feed)  ")
-        logc.grid(row=3, column=0, sticky="nsew")
-        logc.columnconfigure(0, weight=1)
-        logc.rowconfigure(0, weight=1)
-        self.x_log = scrolledtext.ScrolledText(logc, height=14, wrap="none",
-                                               state="disabled")
-        self.x_log.grid(row=0, column=0, sticky="nsew")
-        self._style_text_widget(self.x_log)
-
-    # ------------------------------------------------------------------ #
-    # drag-drop
-    # ------------------------------------------------------------------ #
-    def _card(self, parent, title):
-        """A titled 'card' container (surface background)."""
-        return ttk.LabelFrame(parent, text=title, style="Card.TLabelframe")
-
-    def _make_dropzone(self, parent, text, handler):
-        """A tall drop target that highlights while a file is dragged over it."""
-        p = self.palette
-        dz = tk.Label(parent, text=text, justify="center",
-                      bg=p["drop_idle"], fg=p["text_muted"], font=self.fonts["big"],
-                      height=5, bd=0, highlightthickness=2,
-                      highlightbackground=p["border"], highlightcolor=p["border"])
-        self._register_drop(dz, handler)
-        return dz
-
-    def _style_text_widget(self, w):
-        """Dark styling for a tk Text / ScrolledText."""
-        p = self.palette
-        w.config(bg=p["surface"], fg=p["text"], insertbackground=p["text"],
-                 selectbackground=p["accent"], selectforeground=p["accent_fg"],
-                 relief="flat", borderwidth=0, font=self.fonts["mono"])
-
-    def _register_drop(self, widget, handler):
-        if not self.dnd_ok:
-            return
-        p = self.palette
-
-        def _idle():
-            widget.config(bg=p["drop_idle"], fg=p["text_muted"],
-                          highlightbackground=p["border"], highlightcolor=p["border"])
-
-        def on_enter(event):
-            widget.config(bg=p["drop_hover"], fg=p["text"],
-                          highlightbackground=p["accent"], highlightcolor=p["accent"])
-            return event.action
-
-        def on_leave(event):
-            _idle()
-
-        def on_drop(event):
-            _idle()
-            return handler(event)
-
-        try:
-            widget.drop_target_register(DND_FILES)
-            widget.dnd_bind("<<DropEnter>>", on_enter)
-            widget.dnd_bind("<<DropLeave>>", on_leave)
-            widget.dnd_bind("<<Drop>>", on_drop)
-        except Exception as e:  # pragma: no cover
-            sys.stderr.write("drop registration failed: %r\n" % e)
-
-    def _resolve_dropped_path(self, data):
-        """Turn tkinterdnd2 drop payload into a single real filesystem path.
-        tk.splitlist correctly unwraps the {braces} it puts around paths that
-        contain spaces, and splits multiple dropped items — we take the first."""
-        try:
-            items = self.root.tk.splitlist(data)
-        except Exception:
-            items = [data.strip().strip("{}")]
-        return items[0] if items else ""
-
-    def _on_drop_translate(self, event):
-        path = self._resolve_dropped_path(event.data)
-        if path:
-            self._set_translate_path(path)
-
-    def _on_drop_game(self, event):
-        path = self._resolve_dropped_path(event.data)
-        if path:
-            self._set_game_path(path)
-
-    # ------------------------------------------------------------------ #
-    # Translate tab logic
-    # ------------------------------------------------------------------ #
-    def _browse_translate(self):
-        path = filedialog.askopenfilename(
-            title="Select an MTool-exported JSON",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
-        if path:
-            self._set_translate_path(path)
-
-    def _set_translate_path(self, path):
-        path = os.path.normpath(path)
-        if not os.path.isfile(path):
-            self.t_path_var.set("(not a file) %s" % path)
-            self.translate_path = None
-            return
-        self.translate_path = path
-        self.t_path_var.set(path)
-        root, ext = os.path.splitext(path)
-        self.translate_out_path = root + ".translated" + ext
-        if os.path.exists(self.translate_out_path):
-            self.status_action_var.set("ready — output exists, will RESUME")
-        else:
-            self.status_action_var.set("ready to translate")
-
-    def _start_translate(self):
-        if self.translate_running:
-            return
-        if not self.translate_path:
-            self.status_action_var.set("pick a .json first")
-            return
-        label = self.t_lang_var.get()
-        target = _LANG_BY_LABEL.get(label, LANG_CHOICES[0])[1]
-
-        cfg = core.load_config()
-        cfg["target_language"] = target
-        glossary = core.load_glossary()
-        mode = core.get_mode(cfg)
-        in_path = self.translate_path
-        out_path = self.translate_out_path
-        resuming = os.path.exists(out_path)
-
-        self.translate_stop = threading.Event()
-        self.translate_running = True
-        self.translate_t0 = time.time()
-        self.t_run_btn.config(state="disabled")
-        self.t_stop_btn.config(state="normal")
-        self.t_open_btn.config(state="disabled")
-        self.t_prog.config(mode="determinate", maximum=100, value=0)
-        self.t_prog_var.set("resuming…" if resuming else "starting…")
-        self._clear_text(self.t_feed)
-        self.status_action_var.set(
-            "translating (%s)%s" % (target, " — resuming" if resuming else ""))
-
-        t = threading.Thread(target=self._translate_worker,
-                             args=(in_path, out_path, cfg, glossary, mode),
-                             daemon=True)
-        t.start()
-
-    def _translate_worker(self, in_path, out_path, cfg, glossary, mode):
-        def on_progress(done, total, failures):
-            self.q.put(("t_progress", done, total, failures))
-
-        def on_line(src, tr):
-            self.q.put(("t_line", src, tr))
-
-        try:
-            summary = translate.run_translation(
-                in_path, out_path, cfg, glossary, mode,
-                on_progress=on_progress, on_line=on_line,
-                stop_flag=self.translate_stop)
-            self.q.put(("t_done", summary))
-        except Exception as e:
-            self.q.put(("t_error", repr(e)))
-
-    def _stop_translate(self):
-        if self.translate_stop is not None:
-            self.translate_stop.set()
-            self.status_action_var.set("stopping after this batch…")
-            self.t_stop_btn.config(state="disabled")
-
-    def _open_output_folder(self):
-        path = self.translate_out_path
-        if path and os.path.exists(path):
+    # ------------------------------------------------------------------ window
+    def _apply_geometry(self):
+        r = self.root
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        r.minsize(min(880, sw - 40), min(540, sh - 80))
+        w, h = min(1040, sw - 40), min(680, sh - 90)
+        x, y = (sw - w) // 2, max(0, (sh - h) // 3)
+        m = re.match(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$", str(self.ui_state.get("geometry", "")))
+        if m:
+            gw, gh = int(m.group(1)), int(m.group(2))
+            gx, gy = int(m.group(3)), int(m.group(4))
+            w, h = max(600, min(gw, sw)), max(400, min(gh, sh))
+            if -w + 80 < gx < sw - 80 and 0 <= gy < sh - 80:   # still on screen
+                x, y = gx, gy
+        r.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        if self.ui_state.get("zoomed"):
             try:
-                os.startfile(os.path.dirname(os.path.abspath(path)))
-            except Exception as e:
-                self.status_action_var.set("could not open folder: %r" % e)
-
-    # ------------------------------------------------------------------ #
-    # XUnity tab logic — server
-    # ------------------------------------------------------------------ #
-    def _start_server(self):
-        if self.server_proc is not None and self.server_proc.poll() is None:
-            return
-        env = dict(os.environ)
-        env["PYTHONUTF8"] = "1"
-        try:
-            self.server_proc = subprocess.Popen(
-                [sys.executable, os.path.join(HERE, "server.py")],
-                cwd=HERE, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                bufsize=1, creationflags=_CREATE_NO_WINDOW)
-        except Exception as e:
-            self._xlog("Failed to start server: %r" % e)
-            return
-        self._xlog("Starting server (PYTHONUTF8=1)…")
-        self.x_srv_start.config(state="disabled")
-        self.x_srv_stop.config(state="normal")
-        threading.Thread(target=self._server_reader,
-                         args=(self.server_proc,), daemon=True).start()
-
-    def _server_reader(self, proc):
-        try:
-            for line in proc.stdout:
-                self.q.put(("x_serverlog", line.rstrip("\n")))
-        except Exception as e:
-            self.q.put(("x_serverlog", "[reader error: %r]" % e))
-        self.q.put(("x_serverexit", proc.poll()))
-
-    def _stop_server(self):
-        proc = self.server_proc
-        if proc is None or proc.poll() is not None:
-            return
-        self._xlog("Stopping server…")
-        try:
-            proc.terminate()
-        except Exception as e:
-            self._xlog("terminate failed: %r" % e)
-        # escalate to kill on a short delay, off the UI thread
-        threading.Thread(target=self._ensure_killed, args=(proc,),
-                         daemon=True).start()
-
-    def _ensure_killed(self, proc):
-        try:
-            proc.wait(timeout=4)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
+                r.state("zoomed")
+            except tk.TclError:
                 pass
 
-    # ------------------------------------------------------------------ #
-    # XUnity tab logic — game detection / install
-    # ------------------------------------------------------------------ #
-    def _browse_game(self):
-        path = filedialog.askdirectory(title="Select the Unity game folder")
-        if path:
-            self._set_game_path(path)
+    # ------------------------------------------------------------------ layout
+    def _build_shell(self):
+        r = self.root
+        r.columnconfigure(1, weight=1)
+        r.rowconfigure(0, weight=1)
+        # sidebar
+        side = ttk.Frame(r, style="Nav.TFrame", width=170)
+        side.grid(row=0, column=0, sticky="ns")
+        side.pack_propagate(False)
+        ttk.Label(side, text=APP_TITLE, style="Heading.TLabel",
+                  background=self.palette["surface_alt"]).pack(
+            anchor="w", padx=14, pady=(14, 12))
+        self.page_var = tk.StringVar()
+        self.nav = {}
+        for i, (key, text) in enumerate(PAGES, 1):
+            rb = ttk.Radiobutton(side, text="%s" % text, value=key, variable=self.page_var,
+                                 style="Nav.Toolbutton",
+                                 command=lambda k=key: self.show_page(k))
+            rb.pack(fill="x")
+            self.nav[key] = rb
+        ttk.Separator(r, orient="vertical").grid(row=0, column=0, sticky="nse")
+        # page area
+        self.stack = ttk.Frame(r)
+        self.stack.grid(row=0, column=1, sticky="nsew")
+        self.stack.columnconfigure(0, weight=1)
+        self.stack.rowconfigure(0, weight=1)
+        # status bar
+        bar = ttk.Frame(r, style="Bar.TFrame")
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        inner = ttk.Frame(bar, style="Bar.TFrame")
+        inner.pack(fill="x", padx=10, pady=3)
+        ttk.Label(inner, textvariable=self.status_action_var, style="Bar.TLabel").pack(side="left")
+        ttk.Label(inner, textvariable=self.status_server_var, style="Bar.TLabel").pack(side="right")
+        ttk.Label(inner, text="|", style="Bar.TLabel").pack(side="right", padx=8)
+        ttk.Label(inner, textvariable=self.status_project_var, style="Bar.TLabel").pack(side="right")
+        if not self.dnd_ok:
+            ttk.Label(inner, text="|", style="Bar.TLabel").pack(side="right", padx=8)
+            ttk.Label(inner, text="drag-drop unavailable, use Browse",
+                      style="Bar.TLabel").pack(side="right")
 
-    def _set_game_path(self, path):
-        path = os.path.normpath(path)
-        self.x_path_var.set(path)
-        self.x_detect_var.set("detecting…")
-        self._set_game_buttons(supported=False, applied=False, busy=True)
-        threading.Thread(target=self._detect_worker, args=(path,),
-                         daemon=True).start()
+    def _build_pages(self, start_threads):
+        import pages_projects
+        import pages_providers
+        import pages_settings
+        import pages_xunity
+        self.pages = {}
+        # providers first: it owns provider_items that the Projects page lists
+        self.providers_page = pages_providers.ProvidersPage(self.stack, self)
+        self.projects = pages_projects.ProjectsPage(self.stack, self)
+        self.review_host = ttk.Frame(self.stack, padding=12)
+        self._build_review(self.review_host)
+        self.xunity = pages_xunity.XUnityPage(self.stack, self, start_threads)
+        self.settings_page = pages_settings.SettingsPage(self.stack, self)
+        self.pages = {"projects": self.projects, "review": self.review_host,
+                      "providers": self.providers_page, "xunity": self.xunity,
+                      "settings": self.settings_page}
+        self.projects.refresh_providers()
+        self._cur_page = None
 
-    def _detect_worker(self, path):
+    def _build_review(self, host):
+        host.columnconfigure(0, weight=1)
+        host.rowconfigure(0, weight=1)
+        actions = {"retranslate": lambda ids: self.projects.retranslate(ids),
+                   "save": lambda: self.projects.save_project(),
+                   "status": self.set_status}
         try:
-            d = install_game.detect_game(path)
-            applied = install_game.is_applied(path) if d.get("ok") else False
-        except Exception as e:
-            self.q.put(("x_detect", {"ok": False, "error": repr(e),
-                                     "root": None}, False))
-            return
-        self.q.put(("x_detect", d, applied))
+            from review_page import ReviewPage
+            self.review = ReviewPage(host, self.get_project, actions)
+            self.review.grid(row=0, column=0, sticky="nsew")
+        except ImportError:
+            ttk.Label(host, text="The review page (review_page.py) is not installed yet.",
+                      style="Muted.TLabel").grid(row=0, column=0)
+        except Exception as e:  # a broken review page must not take the app down
+            traceback.print_exc()
+            ttk.Label(host, text="Review page failed to load: %r" % (e,),
+                      style="Danger.TLabel").grid(row=0, column=0)
 
-    def _apply_detect(self, d, applied):
-        self.game_detect = d
-        self.game_root = d.get("root")
-        if not d.get("ok"):
-            self.x_detect_var.set("Unsupported: %s" % (d.get("error") or "not a Unity game"))
-            self._set_game_buttons(supported=False, applied=False)
+    def show_page(self, key):
+        if key not in self.pages or key == getattr(self, "_cur_page", None):
+            self.page_var.set(key if key in self.pages else self.page_var.get())
             return
-        label = d.get("label", "?")
-        if not d.get("supported"):
-            self.x_detect_var.set("%s — unsupported (%s)"
-                                  % (label, d.get("error") or "no template"))
-            self._set_game_buttons(supported=False, applied=applied)
-            return
-        state = "applied" if applied else "not applied"
-        if d.get("experimental"):
-            self.x_detect_var.set("%s — EXPERIMENTAL · %s" % (label, state))
+        if self._cur_page:
+            self.pages[self._cur_page].grid_remove()
+        self.pages[key].grid(row=0, column=0, sticky="nsew")
+        self._cur_page = key
+        self.page_var.set(key)
+
+    # ------------------------------------------------------------------ shared state
+    def get_project(self):
+        return self.project
+
+    def set_project(self, proj, path):
+        self.project, self.project_path = proj, path
+        if proj is None:
+            self.status_project_var.set("no project")
         else:
-            self.x_detect_var.set("%s ✓ — %s" % (label, state))
-        self._set_game_buttons(supported=True, applied=applied)
+            self.status_project_var.set("%s · %d lines" % (proj.engine, len(proj.lines)))
+        if self.review is not None and proj is not None:
+            try:
+                self.review.load(proj)
+            except Exception:
+                traceback.print_exc()
+                self.set_status("review page failed to load the project")
 
-    def _set_game_buttons(self, supported, applied, busy=False):
-        def st(on):
-            return "normal" if (on and not busy) else "disabled"
-        # not applied -> Install; applied -> Re-apply / Reconfigure / Uninstall
-        self.x_install_btn.config(state=st(supported and not applied))
-        self.x_reapply_btn.config(state=st(supported and applied))
-        self.x_reconf_btn.config(state=st(supported and applied))
-        self.x_uninstall_btn.config(state=st(applied))
+    def review_refresh(self, ids):
+        if self.review is not None:
+            try:
+                self.review.refresh_lines(ids)
+            except Exception:
+                traceback.print_exc()
 
-    def _game_action(self, action):
-        if not self.game_root:
-            return
-        label = self.x_lang_var.get()
-        lang = _LANG_BY_LABEL.get(label, LANG_CHOICES[0])[2]
-        self._set_game_buttons(supported=False, applied=False, busy=True)
-        self.status_action_var.set("%s…" % action)
-        self._xlog("=== %s (%s) ===" % (action, lang))
-        threading.Thread(target=self._game_action_worker,
-                         args=(action, self.game_root, lang), daemon=True).start()
+    def set_status(self, text):
+        self.status_action_var.set(text)
 
-    def _game_action_worker(self, action, root, lang):
-        def on_log(msg):
-            self.q.put(("x_actionlog", msg))
-        try:
-            if action == "install":
-                install_game.install(root, lang, on_log=on_log)
-            elif action == "uninstall":
-                install_game.uninstall(root, on_log=on_log)
-            elif action == "reconfigure":
-                res = install_game.reconfigure(root, lang)
-                if res.get("changes"):
-                    for sec, key, old, new in res["changes"]:
-                        on_log("  [%s] %s -> %s" % (sec, key, new))
-                else:
-                    on_log("No changes needed — already configured.")
-                on_log("Config: %s" % res.get("config_path"))
-        except Exception as e:
-            self.q.put(("x_actionlog", "ERROR: %r" % e))
-        self.q.put(("x_actiondone", action, root))
+    def save_settings(self):
+        self.ui_state["settings"] = dict(self.settings)
+        return save_ui_state(self.ui_state)
 
-    # ------------------------------------------------------------------ #
-    # health polling
-    # ------------------------------------------------------------------ #
-    def _start_health_thread(self):
-        threading.Thread(target=self._health_loop, daemon=True).start()
+    def default_provider(self):
+        items = self.provider_items
+        want = self.settings.get("default_provider")
+        for p in items:
+            if p["id"] == want:
+                return p
+        return items[0] if items else None
 
-    def _health_loop(self):
-        while not self._stop_health.is_set():
-            up, _ = install_game.probe_health(self.host, self.port, timeout=1.0)
-            self.q.put(("health", up))
-            self._stop_health.wait(2.0)
+    def providers_changed(self):
+        if self.projects is not None:
+            self.projects.refresh_providers()
 
-    def _refresh_health_once(self):
-        # a one-shot fast probe so status isn't stale for ~2s at startup
-        threading.Thread(
-            target=lambda: self.q.put(
-                ("health", install_game.probe_health(self.host, self.port, 1.0)[0])),
-            daemon=True).start()
+    def build_cfgs(self, prov):
+        """[primary cfg, fallback cfgs...] from config.json + Settings + provider profiles."""
+        base = core.load_config()
+        s = self.settings
+        base.update(target_language=LANG_BY_LABEL.get(s["target_language"], LANG_CHOICES[0])[1],
+                    mode=s["mode"], context_window=s["context_window"],
+                    batch_size=s["batch_size"], context_enabled=s["context_window"] > 0)
+        by_id = {p["id"]: p for p in self.provider_items}
+        order, seen, todo = [], set(), [prov["id"]]
+        while todo:
+            pid = todo.pop(0)
+            if pid in seen or pid not in by_id:
+                continue
+            seen.add(pid)
+            if pid == prov["id"] or by_id[pid].get("enabled", True):
+                order.append(pid)
+            todo.extend(by_id[pid].get("fallback") or [])
+        return [providers.make_cfg(base, by_id[pid]) for pid in order]
 
-    # ------------------------------------------------------------------ #
-    # queue pump (all Tk widget writes happen here, on the main thread)
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ threads / queue
+    def run_thread(self, fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True).start()
+
+    def post(self, *msg):
+        self.q.put(msg)
+
+    def on(self, kind, fn):
+        self._handlers[kind] = fn
+
+    def on_flush(self, fn):
+        self._flush_hooks.append(fn)
+
     def _poll_queue(self):
-        feed_lines = []
         try:
-            while True:
+            for _ in range(MSGS_PER_TICK):
                 msg = self.q.get_nowait()
-                kind = msg[0]
-                if kind == "t_progress":
-                    self._on_t_progress(msg[1], msg[2], msg[3])
-                elif kind == "t_line":
-                    feed_lines.append((msg[1], msg[2]))
-                elif kind == "t_done":
-                    self._on_t_done(msg[1])
-                elif kind == "t_error":
-                    self._on_t_error(msg[1])
-                elif kind == "x_serverlog":
-                    self._xlog(msg[1])
-                elif kind == "x_serverexit":
-                    self._on_server_exit(msg[1])
-                elif kind == "x_actionlog":
-                    self._xlog(msg[1])
-                elif kind == "x_actiondone":
-                    self._on_action_done(msg[1], msg[2])
-                elif kind == "x_detect":
-                    self._apply_detect(msg[1], msg[2])
-                elif kind == "health":
-                    self._on_health(msg[1])
+                fn = self._handlers.get(msg[0])
+                if fn is None:
+                    continue
+                try:
+                    fn(*msg[1:])
+                except Exception:   # one bad message must not stop the pump
+                    traceback.print_exc()
         except queue.Empty:
             pass
-        if feed_lines:
-            self._append_feed(feed_lines)
-        self.root.after(80, self._poll_queue)
-
-    # ---- queue handlers ---- #
-    def _on_t_progress(self, done, total, failures):
-        if total:
-            self.t_prog.config(maximum=total, value=done)
-        elapsed = time.time() - self.translate_t0
-        eta = ""
-        if done and total and elapsed > 0:
-            rate = done / elapsed
-            remaining = max(0, total - done)
-            if rate > 0:
-                eta = " · ETA %s" % self._fmt_eta(remaining / rate)
-        self.t_prog_var.set("%d/%d batches · %d failures%s"
-                            % (done, total, failures, eta))
-
-    def _on_t_done(self, summary):
-        self.translate_running = False
-        self.t_run_btn.config(state="normal")
-        self.t_stop_btn.config(state="disabled")
-        self.t_open_btn.config(state="normal")
-        name = os.path.basename(summary.get("out_path", ""))
-        if summary.get("stopped"):
-            self.t_prog_var.set(
-                "STOPPED after %d/%d batches · %d failures — progress saved"
-                % (summary["batches_done"], summary["total_batches"],
-                   summary["failures"]))
-            self.status_action_var.set("stopped — partial output saved (%s)" % name)
-        else:
-            self.t_prog.config(value=self.t_prog.cget("maximum"))
-            self.t_prog_var.set(
-                "done · %d batches · %d failures · %.1fs"
-                % (summary["total_batches"], summary["failures"],
-                   summary["elapsed"]))
-            self.status_action_var.set(
-                "Wrote %s — import into MTool" % name)
-
-    def _on_t_error(self, err):
-        self.translate_running = False
-        self.t_run_btn.config(state="normal")
-        self.t_stop_btn.config(state="disabled")
-        self.t_prog_var.set("error: %s" % err)
-        self.status_action_var.set("translate error: %s" % err)
-
-    def _on_server_exit(self, code):
-        self.server_proc = None
-        self.server_up = False
-        self._xlog("[server process exited: %s]" % code)
-        self.x_srv_start.config(state="normal")
-        self.x_srv_stop.config(state="disabled")
-        self._on_health(False)
-
-    def _on_action_done(self, action, root):
-        self.status_action_var.set("%s done" % action)
-        self._xlog("=== %s complete ===" % action)
-        # re-detect to refresh the applied state + button set
-        threading.Thread(target=self._detect_worker, args=(root,),
-                         daemon=True).start()
-
-    def _on_health(self, up):
-        self.server_up = up
-        if up:
-            self.status_server_var.set("Server ● running :%d" % self.port)
-            self.x_srv_status.set("● running")
-            self.x_srv_start.config(state="disabled")
-            self.x_srv_stop.config(state="normal")
-        else:
-            self.status_server_var.set("Server ○ stopped")
-            self.x_srv_status.set("○ stopped")
-            if self.server_proc is None or self.server_proc.poll() is not None:
-                self.x_srv_start.config(state="normal")
-                self.x_srv_stop.config(state="disabled")
-
-    # ------------------------------------------------------------------ #
-    # text-widget helpers
-    # ------------------------------------------------------------------ #
-    def _clear_text(self, widget):
-        widget.config(state="normal")
-        widget.delete("1.0", "end")
-        widget.config(state="disabled")
-
-    def _append_text(self, widget, text):
-        widget.config(state="normal")
-        widget.insert("end", text if text.endswith("\n") else text + "\n")
-        self._trim_text(widget)
-        widget.config(state="disabled")
-        widget.see("end")
-
-    def _append_feed(self, pairs):
-        self.t_feed.config(state="normal")
-        for src, tr in pairs:
-            self.t_feed.insert("end", "%s  →  %s\n"
-                               % (self._oneline(src), self._oneline(tr)))
-        self._trim_text(self.t_feed)
-        self.t_feed.config(state="disabled")
-        self.t_feed.see("end")
-
-    def _trim_text(self, widget):
-        # keep only the last MAX_FEED_LINES lines
-        try:
-            last = int(widget.index("end-1c").split(".")[0])
-        except Exception:
-            return
-        if last > MAX_FEED_LINES:
-            widget.delete("1.0", "%d.0" % (last - MAX_FEED_LINES))
-
-    def _xlog(self, text):
-        self._append_text(self.x_log, text)
-
-    @staticmethod
-    def _oneline(s, n=120):
-        s = s.replace("\r", "").replace("\n", " / ")
-        return s if len(s) <= n else s[: n - 1] + "…"
-
-    @staticmethod
-    def _fmt_eta(seconds):
-        seconds = int(seconds)
-        if seconds < 60:
-            return "%ds" % seconds
-        m, s = divmod(seconds, 60)
-        if m < 60:
-            return "%dm%02ds" % (m, s)
-        h, m = divmod(m, 60)
-        return "%dh%02dm" % (h, m)
-
-    # ------------------------------------------------------------------ #
-    # shutdown
-    # ------------------------------------------------------------------ #
-    def _on_close(self):
-        self._stop_health.set()
-        proc = self.server_proc
-        if proc is not None and proc.poll() is None:
+        for fn in self._flush_hooks:
             try:
-                proc.terminate()
+                fn()
+            except Exception:
+                traceback.print_exc()
+        self._after_ids.append(self.root.after(60 if self.q.empty() else 5, self._poll_queue))
+        del self._after_ids[:-4]
+
+    # ------------------------------------------------------------------ shutdown
+    def cancel_timers(self):
+        for i in self._after_ids:
+            try:
+                self.root.after_cancel(i)
             except Exception:
                 pass
-        if self.translate_stop is not None:
-            self.translate_stop.set()
+        self._after_ids = []
+
+    def _on_close(self):
+        self.cancel_timers()
+        try:
+            self.ui_state["page"] = getattr(self, "_cur_page", "projects")
+            if self.root.state() == "zoomed":
+                self.ui_state["zoomed"] = True
+            else:
+                self.ui_state["zoomed"] = False
+                self.ui_state["geometry"] = self.root.geometry()
+            self.save_settings()
+        except Exception:
+            pass
+        if self.projects is not None and self.projects.stop_flag is not None:
+            self.projects.stop_flag.set()
+        if self.xunity is not None:
+            self.xunity.shutdown()
         self.root.destroy()
 
 

@@ -1,0 +1,41 @@
+name: Game compatibility report
+description: Tell us how a real game went
+labels: [compatibility]
+body:
+  - type: input
+    id: game
+    attributes:
+      label: Game and version
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options: [RPG Maker MV/MZ, RPG Maker XP/VX/VX Ace, Wolf RPG Editor, Unity (XUnity live), Other]
+    validations:
+      required: true
+  - type: dropdown
+    id: extract
+    attributes:
+      label: Extract
+      options: [Worked, Partly, Failed, Not tried]
+    validations:
+      required: true
+  - type: dropdown
+    id: patch
+    attributes:
+      label: Patch and game launches
+      options: [Worked, Partly, Game broke, Not tried]
+    validations:
+      required: true
+  - type: dropdown
+    id: rollback
+    attributes:
+      label: Rollback
+      options: [Worked, Failed, Not tried]
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Line counts, warnings, anything odd (garbled text, missing lines, font tofu).
