@@ -1,0 +1,13 @@
+__pycache__/
+*.bak
+*.log
+downloads/
+xunity-template-*/
+nekonokonomachi/
+蜜宵のファミリアver1.00/
+騙され呑みニケーション_Ver1_0_1/
+server_cache.json
+craft*.json
+real_sample*.json
+smoke.translated.json
+config.local.json
