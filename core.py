@@ -564,6 +564,25 @@ def build_solo_user_msg(source, glossary, mode=DEFAULT_MODE, context=None):
 # LLM call
 # --------------------------------------------------------------------------- #
 def call_llm(cfg, user_msg, temperature, max_tokens, mode=DEFAULT_MODE):
+    prov = cfg.get("provider")
+    if prov:
+        import providers  # lazy: providers must not import core at load
+        p_retries = int(cfg.get("network_retries", 3))
+        p_timeout = int(cfg.get("request_timeout_seconds", 600))
+        p_err = None
+        for attempt in range(p_retries):
+            try:
+                return providers.chat(prov, system_prompt(cfg, mode), user_msg,
+                                      temperature, max_tokens, p_timeout)
+            except providers.RateLimited:
+                raise  # chat() already backed off
+            except providers.ProviderError as e:
+                p_err = e
+                if not e.retryable:
+                    break
+                if attempt < p_retries - 1:
+                    time.sleep(2 * (attempt + 1))
+        raise RuntimeError("LLM call failed after %d attempts: %r" % (p_retries, p_err))
     payload = {
         "model": cfg["model"],
         "messages": [
@@ -597,16 +616,28 @@ def call_llm(cfg, user_msg, temperature, max_tokens, mode=DEFAULT_MODE):
     retries = int(cfg.get("network_retries", 3))
     timeout = int(cfg.get("request_timeout_seconds", 600))
     last_err = None
-    for attempt in range(retries):
+    rl_max = int(cfg.get("rate_limit_retries", 4))
+    rl_n = 0
+    attempt = 0
+    while attempt < retries:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             return data["choices"][0]["message"]["content"]
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
                 ConnectionError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                import providers  # lazy: avoid circular import
+                if rl_n >= rl_max:
+                    raise providers.RateLimited(
+                        "rate limited after %d retries" % rl_n, 429, True)
+                time.sleep(providers.backoff_delay(rl_n, e.headers.get("Retry-After")))
+                rl_n += 1
+                continue  # 429 does not consume a network attempt
             last_err = e
             if attempt < retries - 1:
                 time.sleep(2 * (attempt + 1))
+        attempt += 1
     raise RuntimeError("LLM call failed after %d attempts: %r" % (retries, last_err))
 
 

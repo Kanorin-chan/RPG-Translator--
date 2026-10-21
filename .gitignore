@@ -11,3 +11,5 @@ craft*.json
 real_sample*.json
 smoke.translated.json
 config.local.json
+game/
+providers.json
