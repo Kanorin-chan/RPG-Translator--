@@ -51,19 +51,13 @@ from rpgt.unity import variants
 from rpgt import paths
 DOWNLOADS_DIR = paths.DOWNLOADS_DIR
 
-# --- sources (this machine; override via CLI if they ever move) --------------
-HARVEST_BASE = (
-    r"C:\Users\user\Desktop\MegaBasterdWINDOWS\R3946"
-    r"\[silent hentai] 妹妹说要用身体偿还借来的钱 AI翻译版 V1.2"
-)
-OVERLAY_ZIP = (
-    r"C:\Users\user\Downloads\Compressed\Unity"
-    r"\XUnity.AutoTranslator-BepInEx-5.4.5.zip"
-)
-KNOWN_GOOD_CONFIG = (
-    r"D:\Extras\Current\Current Playing\Current Playing"
-    r"\騙され呑みニケーション_Ver1_0_1\BepInEx\AutoTranslator\Config.ini"
-)
+# --- sources: a maintainer's machine; set these env vars or pass the CLI flags ---
+#   RPGT_HARVEST_BASE  a working BepInEx-5 Mono/x64 game install to harvest the runtime from
+#   RPGT_OVERLAY_ZIP   the XUnity.AutoTranslator-BepInEx-5.x zip
+#   RPGT_KNOWN_GOOD_CONFIG  a known-good AutoTranslator Config.ini
+HARVEST_BASE = os.environ.get("RPGT_HARVEST_BASE", "")
+OVERLAY_ZIP = os.environ.get("RPGT_OVERLAY_ZIP", "")
+KNOWN_GOOD_CONFIG = os.environ.get("RPGT_KNOWN_GOOD_CONFIG", "")
 
 # downloaded base/overlay zips (globbed so a version bump is picked up)
 BEPINEX5_X86_GLOB = os.path.join(DOWNLOADS_DIR, "BepInEx_win_x86_5.4.*.zip")
