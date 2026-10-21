@@ -108,7 +108,11 @@ _ALLOWED_RE = re.compile(
 
 # --- Structure tokens whose counts must be preserved across translation:
 #     hearts and RPG-Maker style backslash codes (\N[1], \C[6], \V[3], \., \|). ---
-CODE_RE = re.compile(r"\\[A-Za-z]+\[\d+\]|\\[.|^!><{}]")
+CODE_RE = re.compile(
+    r"\\[A-Za-z]+\[[^\]\n]*\]"          # \N[1] \c[6] and Wolf ruby \r[我,わ]
+    r"|\\[A-Za-z$](?![A-Za-z\[])"       # bare one-letter codes: \E \G \$
+    r"|\\[.|^!><{}]"
+)
 
 # --- Junk detection for the dynamic-mode skip filter. ---
 _PURE_NUMERIC_RE = re.compile(r"[\d\s.,:：%+\-()（）/]+")
