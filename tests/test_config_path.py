@@ -81,6 +81,8 @@ class InstallFontTest(unittest.TestCase):
         through install_game._write_config itself."""
         var = variants.VARIANTS[("Mono", "x64")]
         template = variants.config_template_path(var)
+        if not os.path.isfile(template):  # unity-kits/ is not in git (big downloaded kits)
+            self.skipTest("Unity kit not present: %s" % template)
         with tempfile.TemporaryDirectory() as root:
             install_game._write_config(
                 root, template, variants.DEFAULT_CONFIG_REL, "zh-Hant",
