@@ -9,7 +9,7 @@
 - [ ] Docs / tests
 
 ## How it was verified
-- [ ] `PYTHONUTF8=1 python -m unittest discover -p "test_*.py"` passes
+- [ ] `PYTHONUTF8=1 python -m unittest discover -s tests -t .` passes
 - [ ] Tried on a real game: <!-- name, engine, version -->
 - [ ] Not tried on a real game (say why)
 

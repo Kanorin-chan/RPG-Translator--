@@ -29,7 +29,7 @@ believe is stale — routing around a lie is how projects get rebuilt.
 
 ## Before you write ANY function
 
-**Search for it first.** `core.py` is 573 lines and already has the primitive.
+**Search for it first.** `rpgt/core.py` already has the primitive.
 
 - Exists and fits → **import it.** Never copy its body.
 - Exists but doesn't fit → name the **`file:line`**, extend properly or ask Kano.
@@ -58,13 +58,14 @@ means it agreed with itself.
 - **Stack:** Python 3, stdlib only + `tkinterdnd2` (UI). No venv, no packaging.
 - **Always run with `PYTHONUTF8=1`.** CJK breaks otherwise. Never hand-test CJK
   through curl-from-Git-Bash — it mangles the argv.
-- **Run it:** `run-ui.bat` (control UI) · `run-server.bat` (live server only).
+- **Layout (2026-10-21):** all code is the `rpgt/` package (`core`, `providers`, `runner`, `patcher`, `readers/`, `gui/`, `unity/`, `mtool/`); tests in `tests/`. Older docs and STATUS.md name flat files such as `core.py`, `server.py`, `ui.py`: add `rpgt/`, `rpgt/unity/`, `rpgt/gui/app.py` in front.
+- **Run it:** `run-ui.bat` = `python -m rpgt` (control UI) · `run-server.bat` = `python -m rpgt.unity.server` (live server only).
 - **The brain is external:** local LLM at `http://127.0.0.1:8123/v1/chat/completions`,
   model `gemma4-12b-qat-uncensored-hauhaucs-balanced`, **thinking disabled
   server-side** (non-negotiable — reasoning-on burns 400–2000 tok/line and
   truncates). **It is often down.** Handle that, don't assume it.
 - **Tests:** almost none. The one suite is `test_language_ok.py`
-  (`PYTHONUTF8=1 python test_language_ok.py`, stdlib `unittest`, no LLM needed —
+  (`PYTHONUTF8=1 python -m unittest tests.test_language_ok`, stdlib `unittest`, no LLM needed —
   it tests a pure function against real captured drift pairs). No runner.
 - **Git:** not a repo. There is no undo. Back up before destructive edits.
 

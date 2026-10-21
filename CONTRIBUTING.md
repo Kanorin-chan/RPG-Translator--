@@ -14,7 +14,7 @@ issue template).
 
 ## Tests
 ```
-PYTHONUTF8=1 python -m unittest discover -p "test_*.py"
+PYTHONUTF8=1 python -m unittest discover -s tests -t .
 ```
 No LLM or game files are needed. GUI tests skip when there is no display.
 

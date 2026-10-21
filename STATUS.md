@@ -1,3 +1,5 @@
+> **2026-10-21 layout change:** the flat files moved into the `rpgt/` package (`ui.py` is now `rpgt/gui/app.py`, `server.py`/`install_game.py`/`variants.py` are in `rpgt/unity/`, `translate.py` in `rpgt/mtool/`, tests in `tests/`). Paths below that name a flat file need that prefix.
+
 # eroge-translator — STATUS
 
 > **2026-10-21 expansion (read this first).** Project is becoming **RPG-Translator**.

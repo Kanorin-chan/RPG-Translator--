@@ -42,21 +42,19 @@ Honest table. "Verified" means run on a real game on the author's machine.
 
 | Engine | Extract | Patch + rollback | Notes |
 |---|---|---|---|
-| RPG Maker MV / MZ | Verified (real game, 17,560 lines) | Verified (real data copy, byte-identical rollback) | In-game launch not yet checked |
+| RPG Maker MV / MZ | Verified (real game, 17,560 lines) | Verified (real data copy, byte-identical rollback) | Verified in-game with placeholder text (first scene changed); real translated text not yet checked |
 | RPG Maker XP / VX / VX Ace | Synthetic data only | Synthetic data only | No real game tested yet |
-| Wolf RPG Editor | Verified (real game, 45,305 lines read from `.wolf` archives) | Verified on a scratch copy (loose files written, rollback exact) | Wolf 3.14 archives only. Not yet checked that the game loads patched files, see `readers/WOLF_NOTES.md` |
+| Wolf RPG Editor | Verified (real game, 45,305 lines read from `.wolf` archives) | Verified in-game with placeholder text (opening scene and choices changed); rollback exact | Wolf 3.14 archives only. Patching unpacks and retires the three logic archives (restored by rollback). Real translated text not yet checked in-game, see `rpgt/readers/WOLF_NOTES.md` |
 | Unity (XUnity live) | Live translation verified on one Mono/x64 game | n/a | TextMeshPro font gaps remain, see `STATUS.md` |
 | MTool export (JSON) | Verified | n/a | Fallback input for any engine MTool supports |
 
 ## Quick start
 
-Requires Python 3.12. No packages to install.
+Requires Python 3.10 or newer (developed on 3.12). Nothing else is required.
 
-```bat
-copy config.example.json config.json
-set PYTHONUTF8=1
-run-ui.bat
-```
+Double-click `run-ui.bat`. It finds Python, checks it, creates `config.json` if it is
+missing, and starts the program. For drag and drop of game folders (or a game's `.exe`)
+install the optional helper: `py -m pip install tkinterdnd2`. Without it use the Browse buttons.
 
 1. **Providers** page: add your model (for LM Studio use
    `http://127.0.0.1:8123/v1`), press *Test connection*, then *Run concurrency test*.
@@ -64,7 +62,7 @@ run-ui.bat
 3. **Review** page: check flagged lines, fix or re-translate them.
 4. **Projects** page: *Patch game*. A backup is made first. *Roll back* undoes it.
 
-Command line (offline MTool export): `python translate.py export.json --mode dynamic`
+Command line (offline MTool export): `python -m rpgt.mtool.translate export.json --mode dynamic`
 
 ## Providers and the concurrency test
 
@@ -87,21 +85,32 @@ game files -> reader -> project (lines in play order)
                               v
                        review list  ->  patcher (stage, verify, backup, swap, rollback)
 
-Unity:  game -> XUnity -> server.py -> core -> your model
+Unity:  game -> XUnity -> rpgt/unity/server.py -> core -> your model
 ```
 
-- `core.py` the shared brain: skip filter, prompts, validation
-- `providers.py`, `probe.py` API clients and the concurrency test
-- `readers/` one module per engine family
-- `runner.py` scene-based translation job
-- `patcher.py` backup, verify, swap, rollback
-- `server.py`, `install_game.py` Unity live mode and installer
+```
+run-ui.bat, run-server.bat   launchers (check Python, then start)
+config.example.json          copied to config.json on first run
+glossary.json                your name / term list
+rpgt/
+  core.py                    the shared brain: skip filter, prompts, validation
+  providers.py, probe.py     API clients and the concurrency test
+  runner.py, project.py      scene-based translation job, project file
+  patcher.py                 backup, verify, swap, rollback
+  readers/                   one module per engine (rpgmmv, rpgmruby, wolf)
+  gui/                       the Tkinter program
+  unity/                     XUnity live server and game installer
+  mtool/                     offline MTool-export translator
+tests/                       python -m unittest discover -s tests -t .
+docs/                        specs and design notes
+data/, unity-kits/           runtime caches/logs and Unity kits (not in git)
+```
 
 ## Tests
 
 ```
 set PYTHONUTF8=1
-python -m unittest discover -p "test_*.py"
+python -m unittest discover -s tests -t .
 ```
 
 No model or game files needed. Passing tests mean the code agrees with its
@@ -110,6 +119,11 @@ fixtures. Compatibility with real games is tracked in the table above.
 ## Known gaps
 
 - Only a few real games have been tested. Please file a *Game compatibility* report.
+- Wolf: Wolf 3.31+ and ChaCha-encrypted archives are not supported yet, and a single
+  `Data.wolf` is refused. Wolf's ruby (furigana) codes cannot be translated safely, so
+  those lines are kept as the original and flagged for review.
+- Scenes are read in file order, not the order you play them.
+- Only placeholder text has been checked in a running game; real model output has not.
 - Unity TextMeshPro fonts: some Traditional-only glyphs can render as boxes.
 - Quality depends on the model. Small local models make more mistakes; the review
   list is there for that.
